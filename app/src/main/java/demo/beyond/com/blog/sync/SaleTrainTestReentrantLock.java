@@ -22,13 +22,17 @@ public class SaleTrainTestReentrantLock implements Runnable {
     }
 
     public static void main(String[] args) {
-        SaleTrainTestReentrantLock syncThread1 = new SaleTrainTestReentrantLock();
-        SaleTrainTestReentrantLock syncThread2 = new SaleTrainTestReentrantLock();
-        //不同对象
-        Thread thread1 = new Thread(syncThread1, "买家1");
-        Thread thread2 = new Thread(syncThread2, "买家2");
-        thread1.start();
-        thread2.start();
+//        SaleTrainTestReentrantLock syncThread1 = new SaleTrainTestReentrantLock();
+//        SaleTrainTestReentrantLock syncThread2 = new SaleTrainTestReentrantLock();
+//        //不同对象
+//        Thread thread1 = new Thread(syncThread1, "买家1");
+//        Thread thread2 = new Thread(syncThread2, "买家2");
+//        thread1.start();
+//        thread2.start();
+
+        for (int i = 0; i < 10; i++) {
+            new Thread(new SaleTrainTestReentrantLock(), "买家" + i).start();
+        }
     }
 }
 

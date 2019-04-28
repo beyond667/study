@@ -115,7 +115,14 @@ ReentrantLock用的是乐观锁，Synchronized用的是悲观锁。
 + Synchronized在资源竞争不是很激烈的情况下(大部分synchronized块几乎从来都没发生过争用)，或者偶尔会有同步是很合适的（线程少）。如果有大量线程同时竞争，ReentrantLock是很合适的。所以大部分情况下都用Synchronized，直到确实证明不适合。java官方也建议用Synchronized
 + 只有你确实需要ReentrantLock的3个特性的时候才考虑这个。
 
-
+##### volatile
+volatile是java的关键字，用来声明变量的值可能随时会被别的线程修改，使用volatile修饰的变量会强制将修改后的值写入主存。
+volatile不具备原子性，为了保证线程安全，还是需要加锁来保证原子性，所以使用场景非常有限。由于volatile不会像加锁那样线程阻塞，所以非常适合于读操作远远大于写操作。
+###### 适用场景
+- 读多写少
+- 可用作状态标示
+对于开头提的卖票问题，由于volatile修饰的变量自增自减不具备原子性，显然是不适用的。这种情况下可以用AtomicInteger类来保证原子性。
+AtomicInteger的自增自减具有原子性底层原理也是先自增自减，再通过CAS操作来保证原子性的。
 
 
 

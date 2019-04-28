@@ -17,13 +17,16 @@ public class SaleTrainTestSynchronized implements Runnable {
     }
 
     public static void main(String[] args) {
-        SaleTrainTestSynchronized syncThread1 = new SaleTrainTestSynchronized();
-        SaleTrainTestSynchronized syncThread2 = new SaleTrainTestSynchronized();
-        //不同对象
-        Thread thread1 = new Thread(syncThread1, "买家1");
-        Thread thread2 = new Thread(syncThread2, "买家2");
-        thread1.start();
-        thread2.start();
+//        SaleTrainTestSynchronized syncThread1 = new SaleTrainTestSynchronized();
+//        SaleTrainTestSynchronized syncThread2 = new SaleTrainTestSynchronized();
+//        //不同对象
+//        Thread thread1 = new Thread(syncThread1, "买家1");
+//        Thread thread2 = new Thread(syncThread2, "买家2");
+//        thread1.start();
+//        thread2.start();
+        for (int i = 0; i < 10; i++) {
+            new Thread(new SaleTrainTestReentrantLock(), "买家" + i).start();
+        }
     }
 }
 
