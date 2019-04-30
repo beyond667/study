@@ -124,6 +124,16 @@ volatile不具备原子性，为了保证线程安全，还是需要加锁来保
 对于开头提的卖票问题，由于volatile修饰的变量自增自减不具备原子性，显然是不适用的。这种情况下可以用AtomicInteger类来保证原子性。
 AtomicInteger的自增自减具有原子性底层原理也是先自增自减，再通过CAS操作来保证原子性的。
 
+##### wait && notify/notifyAll
+- Object基础类的final方法，不能重写，不是Thread的方法。因为每个对象都有一个锁，这三个方法是最基础的锁操作。
+- 调用以上方法一定要加锁，否则会抛IllegalMonitorStateException锁状态异常。所以一般要在Synchronized同步代码块中。
+- 调用wait时会释放当前的锁，进入blocked状态，直到notify/notifyAll被执行，才会唤醒一个或者多个处在等待状态的线程，然后继续往下执行，直到执行完Synchronized代码块或者继续wait，再次释放锁。也就是说notify只是唤醒线程，而不会立即释放锁。
+- wait需要被try/catch包围，中断也会使wait的线程唤醒。另外尽量在while循环中而不是if中使用wait。
+- 假如有3个线程执行了obj.wait(),那么obj.notifyAll()能全部唤醒这三个线程，但是要继续执行wait的下一条语句，必须先获得Obj的锁。假如线程1获取到了锁，其他的线程需要等待线程1释放obj锁才能继续执行。
+- 当调用notify后，调用线程依然持有obj锁，因此，3个线程虽然被唤醒，但是仍无法获取到obj锁，直到调用线程退出Synchronized块，释放obj锁之后这3个线程才有机会获得锁继续执行。
+- 适合生产者消费者模型
+
+###### 生产者消费者模型
 
 
 
