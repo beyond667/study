@@ -117,7 +117,19 @@ ReentrantLock用的是乐观锁，Synchronized用的是悲观锁。
 
 ##### volatile
 volatile是java的关键字，用来声明变量的值可能随时会被别的线程修改，使用volatile修饰的变量会强制将修改后的值写入主存。
-volatile不具备原子性，为了保证线程安全，还是需要加锁来保证原子性，所以使用场景非常有限。由于volatile不会像加锁那样线程阻塞，所以非常适合于读操作远远大于写操作。
++ 内存可见性 在多线程环境，共享变量的操作对于每个线程来说，都是内存可见的，也就是每个线程获取的volatile变量都是最新值；并且每个线程对volatile变量的修改，都直接刷新到主存。
++ 禁止指令重排序 为了优化编译速度，编译器在编译代码的时候并不是按照顺序编译，能保证结果一致但是不能保证编译过程一致。这在单线程处理中没任何问题，但在多线程中由于执行顺序不可控会影响到执行的正确性。
+volatile禁止重排序底层实现原理是加上lock前缀指令，lock后就是一个原子操作，会使cpu发一条lock信号，确保多线程竞争的环境下互斥的使用这个内存地址，
+执行完之后这个lock动作就会消失(对比synchronized的重量级锁，这个更底层更轻量，消耗代价更小）。lock前缀就相当于一个内存屏障，用来实现对内存操作的顺序限制。
+volatile就是通过内存屏障来实现的。内存屏障相当于告诉编译器这个命令必须先执行，这样其他线程读取被volatile修饰的数据会先去主内存中获取最新值，这也是实现可见性的基础。
+
+⚠️volatile不具备原子性，为了保证线程安全，还是需要加锁来保证原子性，所以使用场景非常有限。由于volatile不会像加锁那样线程阻塞，所以非常适合于读操作远远大于写操作。
+###### volatile原理
+处理器为了提高处理速度，不直接和内存进行通讯，而是先将系统内存的数据读到内部缓存后再进行操作，但操作完之后并不会立即写到内存，
+如果对声明了Volatile变量进行写操作，JVM就会向处理器发送一条Lock前缀的指令，将这个变量所在缓存行的数据写回到系统内存。但是就算写回到内存，
+如果其他处理器缓存的值还是旧的，再执行计算操作就会有问题，所以在多处理器下，为了保证各个处理器的缓存是一致的，就会实现缓存一致性协议，
+每个处理器通过嗅探在总线上传播的数据来检查自己缓存的值是不是过期了，当处理器发现自己缓存行对应的内存地址被修改，
+就会将当前处理器的缓存行设置成无效状态，当处理器要对这个数据进行修改操作的时候，会强制重新从系统内存里把数据读到处理器缓存里。
 ###### 适用场景
 - 读多写少
 - 可用作状态标示
@@ -134,9 +146,125 @@ AtomicInteger的自增自减具有原子性底层原理也是先自增自减，�
 - 适合生产者消费者模型
 
 ###### 生产者消费者模型
+假设有一个公共的容量有限的池子，有两种人，一种生产者，一种消费者。
+生产者往池子里添加产品，如果池子满了就停止生产，直到池子里的产品被消耗能重新放进去。消费者消耗池子里的资源，如果池子里资源为空则停止消耗，直到池子里有产品。
+不解释了，直接上代码，池子数量以及生产者和消费者数量可以自己设置。
 
+另外Synchronized,ReentrantLock,以及Volatile实现开头那问题的见链接：
+[synchronized实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestSynchronized.java "synchronized实现卖票")
+[ReentrantLock实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestReentrantLock.java "ReentrantLock实现卖票")
+[volatile实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestVolatile.java "volatile实现卖票")
 
+Volatile实现卖票
 
+```
+public class SaleTrainTestWait {
+
+    private Ticket mTicket = new Ticket();
+
+    public void produce() {
+        synchronized (this) {
+            while (mTicket.isFull()) {
+                try {
+                    System.out.println(Thread.currentThread().getName() + "池子已经满了，售票员等待中。。。" + mTicket.innerList.size());
+                    wait();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+            mTicket.add();
+            notifyAll();
+        }
+    }
+
+    public void consume() {
+        synchronized (this) {
+            while (mTicket.isEmpty()) {
+                try {
+                    System.out.println(Thread.currentThread().getName() + "池子已经空了,买家等待中。。。" + mTicket.innerList.size());
+                    wait();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+            mTicket.remove();
+            notifyAll();
+        }
+    }
+
+    private class Ticket {
+        private static final int MAX_CAPACITY = 10;
+        private List innerList = new ArrayList<>(MAX_CAPACITY);
+
+        void add() {
+            if (isFull()) {
+                throw new IndexOutOfBoundsException();
+            } else {
+                innerList.add(new Object());
+            }
+            System.out.println(Thread.currentThread().getName() + " 生产后池子剩余" + innerList.size());
+        }
+
+        void remove() {
+            if (isEmpty()) {
+                throw new IndexOutOfBoundsException();
+            } else {
+                innerList.remove((innerList.size() - 1));
+            }
+            System.out.println(Thread.currentThread().getName() + " 消费后池子剩余" + innerList.size());
+        }
+
+        boolean isEmpty() {
+            return innerList.isEmpty();
+        }
+
+        boolean isFull() {
+            return innerList.size() == MAX_CAPACITY;
+        }
+    }
+
+    static SaleTrainTestWait sth = new SaleTrainTestWait();
+
+    public static void main(String[] args) {
+        Product productRun = new Product();
+        Consume consumeRun = new Consume();
+        //如果只有一个买家和售票员
+//        new Thread(consumeRun, "买家").start();
+//        new Thread(productRun, "售票员").start();
+
+        //多个买家 多个售票员
+        for (int i = 0; i < 10; i++) {
+            new Thread(consumeRun,"买家"+i).start();
+        }
+        for (int i = 0; i < 10; i++) {
+            new Thread(productRun,"售票员"+i).start();
+        }
+    }
+
+    static class Product implements Runnable {
+        int count = 10000;
+
+        @Override
+        public void run() {
+            while (count-- > 0) {
+                sth.produce();
+            }
+        }
+    }
+
+    static class Consume implements Runnable {
+        int count = 10000;
+
+        @Override
+        public void run() {
+            while (count-- > 0) {
+                sth.consume();
+            }
+        }
+    }
+}
+
+```
 
 
 

@@ -2,45 +2,46 @@ package demo.beyond.com.blog.sync;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 卖火车票的例子
+ * 生产者消费者问题
  * wait notify 方式实现
  */
-public class SaleTrainTestWait  {
+public class SaleTrainTestWait {
 
-    private Buffer mBuf = new Buffer();
+    private Ticket mTicket = new Ticket();
 
     public void produce() {
         synchronized (this) {
-            while (mBuf.isFull()) {
+            while (mTicket.isFull()) {
                 try {
+                    System.out.println(Thread.currentThread().getName() + "池子已经满了，售票员等待中。。。" + mTicket.innerList.size());
                     wait();
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
             }
-            mBuf.add();
+            mTicket.add();
             notifyAll();
         }
     }
 
     public void consume() {
         synchronized (this) {
-            while (mBuf.isEmpty()) {
+            while (mTicket.isEmpty()) {
                 try {
+                    System.out.println(Thread.currentThread().getName() + "池子已经空了,买家等待中。。。" + mTicket.innerList.size());
                     wait();
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
             }
-            mBuf.remove();
+            mTicket.remove();
             notifyAll();
         }
     }
 
-    private class Buffer {
+    private class Ticket {
         private static final int MAX_CAPACITY = 10;
         private List innerList = new ArrayList<>(MAX_CAPACITY);
 
@@ -50,17 +51,16 @@ public class SaleTrainTestWait  {
             } else {
                 innerList.add(new Object());
             }
-            System.out.println(Thread.currentThread().toString() + " add");
-
+            System.out.println(Thread.currentThread().getName() + " 生产后池子剩余" + innerList.size());
         }
 
         void remove() {
             if (isEmpty()) {
                 throw new IndexOutOfBoundsException();
             } else {
-                innerList.remove(MAX_CAPACITY - 1);
+                innerList.remove((innerList.size() - 1));
             }
-            System.out.println(Thread.currentThread().toString() + " remove");
+            System.out.println(Thread.currentThread().getName() + " 消费后池子剩余" + innerList.size());
         }
 
         boolean isEmpty() {
@@ -72,35 +72,43 @@ public class SaleTrainTestWait  {
         }
     }
 
+    static SaleTrainTestWait sth = new SaleTrainTestWait();
+
     public static void main(String[] args) {
-        final SaleTrainTestWait sth = new SaleTrainTestWait();
-        Runnable runProduce = new Runnable() {
-            int count = 10000;
+        Product productRun = new Product();
+        Consume consumeRun = new Consume();
+        //如果只有一个买家和售票员
+//        new Thread(consumeRun, "买家").start();
+//        new Thread(productRun, "售票员").start();
 
-            @Override
-            public void run() {
-                while (count-- > 0) {
-//                    System.out.println(Thread.currentThread().getName()+"=出票后剩余=="+count);
-                    sth.produce();
-                }
-            }
-        };
-        Runnable runConsume = new Runnable() {
-            int count = 10000;
-
-            @Override
-            public void run() {
-                while (count-- > 0) {
-//                    System.out.println(Thread.currentThread().getName()+"=买后剩余=="+count);
-                    sth.consume();
-                }
-            }
-        };
+        //多个买家 多个售票员
         for (int i = 0; i < 10; i++) {
-            new Thread(runConsume,"买家"+i).start();
+            new Thread(consumeRun,"买家"+i).start();
         }
         for (int i = 0; i < 10; i++) {
-            new Thread(runProduce,"售票员"+i).start();
+            new Thread(productRun,"售票员"+i).start();
+        }
+    }
+
+    static class Product implements Runnable {
+        int count = 10000;
+
+        @Override
+        public void run() {
+            while (count-- > 0) {
+                sth.produce();
+            }
+        }
+    }
+
+    static class Consume implements Runnable {
+        int count = 10000;
+
+        @Override
+        public void run() {
+            while (count-- > 0) {
+                sth.consume();
+            }
         }
     }
 }
