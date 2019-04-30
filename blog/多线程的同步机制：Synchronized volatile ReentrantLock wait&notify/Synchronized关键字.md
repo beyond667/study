@@ -103,7 +103,7 @@ ReentrantLock用的是乐观锁，Synchronized用的是悲观锁。
 虽然变量的值没有改变，但是数据确实是改变了。可以使用版本号机制或者CAS算法来避免这个问题。
 
 ###### Synchronized和ReentrantLock比较
-####### 相似点
+###### 相似点
 它们都是加锁方式同步，而且都是阻塞式的同步，也就是说如果一个线程获得了对象锁，进入了同步块，其他访问该同步块的线程都必须阻塞在同步块外面等待。
 ####### 区别
 + 对于Synchronized来说，它是java的关键字，是原生语法层面的互斥，需要jvm通过monitorEnter和monitorExit指令来实现。而ReentrantLock是jdk1.5之后提供的API层面的互斥锁，需要lock和unlock方法配合try/finally来完成。
@@ -151,11 +151,9 @@ AtomicInteger的自增自减具有原子性底层原理也是先自增自减，�
 不解释了，直接上代码，池子数量以及生产者和消费者数量可以自己设置。
 
 另外Synchronized,ReentrantLock,以及Volatile实现开头那问题的见链接：
-[synchronized实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestSynchronized.java "synchronized实现卖票")
-[ReentrantLock实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestReentrantLock.java "ReentrantLock实现卖票")
-[volatile实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestVolatile.java "volatile实现卖票")
-
-Volatile实现卖票
+- [synchronized实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestSynchronized.java "synchronized实现卖票")
+- [ReentrantLock实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestReentrantLock.java "ReentrantLock实现卖票")
+- [volatile实现卖票](https://github.com/beyond667/study/blob/master/app/src/main/java/demo/beyond/com/blog/sync/SaleTrainTestVolatile.java "volatile实现卖票")
 
 ```
 public class SaleTrainTestWait {
