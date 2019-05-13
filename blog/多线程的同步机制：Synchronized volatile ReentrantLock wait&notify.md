@@ -1,7 +1,7 @@
 ---
 title: 多线程的同步机制：Synchronized volatile ReentrantLock wait&notify
 date: 2019-05-11 22:32:37
-tags: Java ANdroid
+tags: [Java,Android]
 cover_img: /img/背景1.jpg
 ---
 
