@@ -35,20 +35,6 @@
         android:text="bind(important)"/>
 
     <Button
-        android:id="@+id/bt_not_foreground"
-        android:layout_marginTop="20dp"
-        android:layout_width="match_parent"
-        android:layout_height="40dp"
-        android:text="bind(not foreground)"/>
-
-    <Button
-        android:id="@+id/bt_debug_unbind"
-        android:layout_marginTop="20dp"
-        android:layout_width="match_parent"
-        android:layout_height="40dp"
-        android:text="bind(debug_unbind)"/>
-
-    <Button
         android:id="@+id/bt_unbind"
         android:layout_marginTop="20dp"
         android:layout_width="match_parent"
