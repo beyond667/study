@@ -40,4 +40,11 @@
         android:layout_width="match_parent"
         android:layout_height="40dp"
         android:text="unbind"/>
+
+    <Button
+        android:id="@+id/bt_intent_service"
+        android:layout_marginTop="20dp"
+        android:layout_width="match_parent"
+        android:layout_height="40dp"
+        android:text="bt_intent_service"/>
 </LinearLayout>

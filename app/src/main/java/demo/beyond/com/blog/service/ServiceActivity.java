@@ -37,7 +37,7 @@ public class ServiceActivity extends AppCompatActivity{
         }
 
     }
-    @OnClick({R.id.bt_start,R.id.bt_stop,R.id.bt_bind,R.id.bt_unbind,
+    @OnClick({R.id.bt_start,R.id.bt_stop,R.id.bt_bind,R.id.bt_unbind,R.id.bt_intent_service,
             R.id.bt_bind_important,})
     void clickView(View view) {
         Intent intent = new Intent(ServiceActivity.this,MyService.class);
@@ -53,6 +53,11 @@ public class ServiceActivity extends AppCompatActivity{
                 break;
             case R.id.bt_bind_important:
                 bindService(intent,connection,BIND_IMPORTANT);
+                break;
+            case R.id.bt_intent_service:
+                Intent intent1 = new Intent(ServiceActivity.this,MyIntentService.class);
+                intent.putExtra("11","aa");
+                startService(intent1);
                 break;
             default:
                 break;
