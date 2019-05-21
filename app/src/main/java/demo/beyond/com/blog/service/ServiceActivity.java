@@ -38,7 +38,7 @@ public class ServiceActivity extends AppCompatActivity{
 
     }
     @OnClick({R.id.bt_start,R.id.bt_stop,R.id.bt_bind,R.id.bt_unbind,R.id.bt_intent_service,
-            R.id.bt_bind_important,})
+            R.id.bt_bind_important,R.id.bt_aidl})
     void clickView(View view) {
         Intent intent = new Intent(ServiceActivity.this,MyService.class);
         switch (view.getId()) {
@@ -56,13 +56,30 @@ public class ServiceActivity extends AppCompatActivity{
                 break;
             case R.id.bt_intent_service:
                 Intent intent1 = new Intent(ServiceActivity.this,MyIntentService.class);
-                intent.putExtra("11","aa");
                 startService(intent1);
+                break;
+
+            case R.id.bt_aidl:
+                Intent intent2 = new Intent(ServiceActivity.this,AIDLService.class);
+                intent2.putExtra("11","aa");
+                bindService(intent2,connection1,BIND_AUTO_CREATE);
                 break;
             default:
                 break;
         }
     }
+
+    private ServiceConnection connection1 = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName componentName, IBinder iBinder) {
+
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName componentName) {
+            Log.e("===","=====onServiceDisconnected");
+        }
+    };
 
     private ServiceConnection connection = new ServiceConnection() {
         @Override

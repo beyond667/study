@@ -26,6 +26,17 @@
             android:name=".service.MyIntentService"
             android:enabled="true"
             android:exported="true"></service>
+
+        <service
+            android:name=".service.AIDLService"
+            android:enabled="true"
+            android:process=":remote"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="demo.beyond.com.blog.service.AIDLService" />
+            </intent-filter>
+
+        </service>
     </application>
 
 </manifest>
