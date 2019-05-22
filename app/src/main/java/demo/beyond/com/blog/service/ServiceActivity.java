@@ -1,5 +1,6 @@
 package demo.beyond.com.blog.service;
 
+import android.app.ActivityManager;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
