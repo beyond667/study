@@ -18,6 +18,7 @@
             </intent-filter>
         </activity>
         <activity android:name=".service.ServiceActivity" />
+        <activity android:name=".activity.IntentActivity" />
         <service
             android:name=".service.MyService"
             android:enabled="true"

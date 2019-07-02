@@ -11,6 +11,7 @@ import android.widget.ImageView;
 import butterknife.BindView;
 import butterknife.ButterKnife;
 import butterknife.OnClick;
+import demo.beyond.com.blog.activity.IntentActivity;
 import demo.beyond.com.blog.service.ServiceActivity;
 
 public class MainActivity extends AppCompatActivity {
@@ -25,12 +26,16 @@ public class MainActivity extends AppCompatActivity {
         ButterKnife.bind(this);
     }
 
-    @OnClick({R.id.service_activity})
+    @OnClick({R.id.service_activity,R.id.activity})
     void clickView(View view) {
         switch (view.getId()) {
             case R.id.service_activity:
                 serviceActivity.startAnimation(AnimationUtils.loadAnimation(this,R.anim.anim_scale_alpha_out));
                 startActivity(new Intent(MainActivity.this, ServiceActivity.class));
+                break;
+
+            case R.id.activity:
+                startActivity(new Intent(MainActivity.this, IntentActivity.class));
                 break;
             default:
                 break;
