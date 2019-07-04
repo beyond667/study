@@ -12,6 +12,7 @@ import butterknife.BindView;
 import butterknife.ButterKnife;
 import butterknife.OnClick;
 import demo.beyond.com.blog.activity.IntentActivity;
+import demo.beyond.com.blog.activity.LifeActivity;
 import demo.beyond.com.blog.service.ServiceActivity;
 
 public class MainActivity extends AppCompatActivity {
@@ -26,7 +27,7 @@ public class MainActivity extends AppCompatActivity {
         ButterKnife.bind(this);
     }
 
-    @OnClick({R.id.service_activity,R.id.activity})
+    @OnClick({R.id.service_activity,R.id.activity,R.id.activity_life})
     void clickView(View view) {
         switch (view.getId()) {
             case R.id.service_activity:
@@ -36,6 +37,9 @@ public class MainActivity extends AppCompatActivity {
 
             case R.id.activity:
                 startActivity(new Intent(MainActivity.this, IntentActivity.class));
+                break;
+            case R.id.activity_life:
+                startActivity(new Intent(MainActivity.this, LifeActivity.class));
                 break;
             default:
                 break;

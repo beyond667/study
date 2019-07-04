@@ -19,6 +19,9 @@
         </activity>
         <activity android:name=".service.ServiceActivity" />
         <activity android:name=".activity.IntentActivity" />
+        <activity android:name=".activity.LifeActivity"
+            android:configChanges="orientation"/>
+        <activity android:name=".activity.SecondActivity" />
         <service
             android:name=".service.MyService"
             android:enabled="true"
