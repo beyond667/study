@@ -1,10 +1,3 @@
----
-title: 多线程的同步机制：Synchronized volatile ReentrantLock wait&notify
-date: 2019-05-11 22:32:37
-tags: [Java,Android]
-cover_img: /img/背景1.jpg
----
-
 #### 前言
 多线程的同步机制是java的基础。
 先看一个案例：现在有100张火车票，有两个窗口同时抢火车票，请使用多线程模拟抢票效果。
@@ -17,7 +10,7 @@ cover_img: /img/背景1.jpg
  注：做读操作不会发生线程安全问题。
  ````
  有多种方式可以实现多线程的同步，Synchronized，ReentrantLock，volatile，wait&notify，我们来分别学习一下。
- 
+
 #### Synchronized
 synchronized是Java中的关键字，是一种同步锁。它修饰的对象有以下几种： 
 + 修饰一个代码块，被修饰的代码块称为同步语句块，其作用的范围是大括号{}括起来的代码（锁的是小括号里传的对象或者类）
