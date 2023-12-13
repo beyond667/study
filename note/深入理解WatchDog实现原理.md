@@ -1,6 +1,6 @@
 #### 深入理解Watchdog实现原理分析 ####
 
-#### #### 前言
+#### 前言
 
 ##### 1.1 主要内容
 
@@ -211,7 +211,7 @@ private void run() {
             }
         } // END synchronized (mLock)
 
-        //------------关键4 dump日志，写入dropbox文件；如果是等待一半状态，先调ams的dumpStackTraces先dump下，continue退出此次循环
+        //------------关键4 dump日志，写入dropbox文件；如果是等待一半状态，先调ams的dumpStackTraces去dump下，continue退出此次循环
         if (doWaitedHalfDump) {
             ArrayList<Integer> nativePids = getInterestingNativePids();
             // We've waited half the deadlock-detection interval.  Pull a stack
