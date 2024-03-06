@@ -607,6 +607,19 @@ public class TransactionExecutor {
         lifecycleItem.execute(mTransactionHandler, token, mPendingActions);
     }
 }
+LaunchActivityItem.java
+public class LaunchActivityItem extends ClientTransactionItem {
+    public void execute(ClientTransactionHandler client, IBinder token, PendingTransactionActions pendingActions) {
+        ActivityClientRecord r = new ActivityClientRecord(token, mIntent...);
+        client.handleLaunchActivity(r, pendingActions, null /* customIntent */);
+    }
+}
+ResumeActivityItem.java
+public class ResumeActivityItem extends ActivityLifecycleItem {
+    public void execute(ClientTransactionHandler client, ActivityClientRecord r,PendingTransactionActions pendingActions) {
+        client.handleResumeActivity(r, true, mIsForward,"RESUME_ACTIVITY");
+    }
+}
 ```
 
 这里看到拿到callback并执行其execute，即先执行LaunchActivityItem.execute，之后执行ResumeActivityItem.execute，这两个方法分别执行了ActivityThread的handleLaunchActivity和handleResumeActivity  
@@ -808,7 +821,7 @@ public void setView(View view, WindowManager.LayoutParams attrs, View panelParen
     //添加窗口
     res = mWindowSession.addToDisplayAsUser(mWindow, mWindowAttributes...);
     //...
-    // 把DecorView的parent设为ViewRootImpl
+    // 把DecorView的parent设为ViewRootImpl，即把DecorView与ViewRootImpl关联起来
     view.assignParent(this);
     //...
 }
@@ -843,4 +856,4 @@ void checkThread() {
 }
 ```
 
-要更新UI，比如更新TextView，Button（继承TextView），都会调用View.requestLayout，然后一直调用父view的requestLayout，直到DecorView，DecorView的parent是ViewRootImpl，即最终调用到ViewRootImpl.requestLayout。这里会检查当前线程是否和初始化ViewRootImpl时的线程即主线程一样，不一样的话就抛异常。所以要在子线程更新UI，就想办法绕开checkThread。比如执行完Activity的onResume后才执行WindowManagerImpl.addView>WindowManagerGlobal.addView(new了ViewRootImpl)>ViewRootImpl.setView，这时候才view.assignParent(this);把DecorView和ViewRootImpl绑定起来，所以，在其绑定parent之前更新UI即可绕过线程检查。即只要在activty.onResume调用完在异步线程更新UI都可以。
+要更新UI，比如更新TextView，Button（继承TextView），都会调用View.requestLayout，然后一直调用父view的requestLayout，直到DecorView，DecorView的parent是ViewRootImpl，即最终调用到ViewRootImpl.requestLayout。这里会检查当前线程是否和初始化ViewRootImpl时的线程即主线程一样，不一样的话就抛异常。所以要在子线程更新UI，就想办法绕开checkThread。比如执行完Activity的onResume后才执行WindowManagerImpl.addView>WindowManagerGlobal.addView(new了ViewRootImpl)>ViewRootImpl.setView，这时候才view.assignParent(this);把DecorView和ViewRootImpl绑定起来，所以，在其绑定parent之前更新UI即可绕过线程检查。即只要在activty.onResume调用完之前（即在onResume里）在异步线程更新UI都可以。
