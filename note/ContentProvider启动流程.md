@@ -164,6 +164,117 @@ getContentProviderImpl这个方法比较长，只关注核心流程
 ```java
 private ContentProviderHolder getContentProviderImpl(IApplicationThread caller, String name, IBinder token...) {
 
+    ContentProviderRecord cpr;
+    ContentProviderConnection conn = null;
+    ProviderInfo cpi = null;
+    boolean providerRunning = false;
+
+    ProcessRecord r = null;
+    r = mService.getRecordForAppLOSP(caller);
+
+	//1 先从mProviderMap缓存去获取ContentProviderRecord，如果能拿到并且其进程存活，先查下provider是否在运行
+    cpr = mProviderMap.getProviderByName(name, userId);
+    if (cpr != null && cpr.proc != null) {
+        providerRunning = !cpr.proc.isKilled();
+    }
+
+    if (providerRunning) {
+        cpi = cpr.info;
+        //2 provider已经在运行时如果配置了multiprocess=true或者要启动的contentprovider就是调用进程
+        if (r != null && cpr.canRunHere(r)) {
+            ContentProviderHolder holder = cpr.newHolder(null, true);
+            holder.provider = null;
+            return holder;
+        }
+    }
+
+    if (!providerRunning) {
+        //3 provider没在运行，先通过pms去获取ContentProvider的信息
+        cpi = AppGlobals.getPackageManager().resolveContentProvider(name...);
+        if (cpi == null) {
+            return null;
+        }
+        //4 再在缓存里通过类再找下ContentProviderRecord是否存在
+        cpr = mProviderMap.getProviderByClass(comp, userId);
+        boolean firstClass = cpr == null || (dyingProc == cpr.proc && dyingProc != null);
+        if (firstClass) {
+            //5 不存在就先跟注释2一样先判断是不是在调用进程启动，否则就直接new出来ContentProviderRecord
+            if (r != null && cpr.canRunHere(r)) {
+                return cpr.newHolder(null, true);
+            }
+            cpr = new ContentProviderRecord(mService, cpi, ai, comp, singleton);
+        }
+		//6 到这里cpr肯定不为空，一样的套路再判断下
+        if (r != null && cpr.canRunHere(r)) {
+            return cpr.newHolder(null, true);
+        }
+
+		//7 到这里就说明要启动的contentprovider跟调用进程不是同一个进程。这里先从已经启动的providers缓存里找目标进程是否存在
+        final int numLaunchingProviders = mLaunchingProviders.size();
+        int i;
+        for (i = 0; i < numLaunchingProviders; i++) {
+            if (mLaunchingProviders.get(i) == cpr) {
+                break;
+            }
+        }
+
+        //8 正常情况找不到的话i==numLaunchingProviders
+        if (i >= numLaunchingProviders) {
+            //9
+            ProcessRecord proc = mService.getProcessRecordLocked(cpi.processName, cpr.appInfo.uid);
+            IApplicationThread thread;
+            if (proc != null && (thread = proc.getThread()) != null
+                && !proc.isKilled()) {
+
+            }else{
+                proc = mService.startProcessLocked(cpi.processName, cpr.appInfo, false, 0...);
+            }
+            cpr.launchingApp = proc;
+            mLaunchingProviders.add(cpr);
+        }
+
+        if (firstClass) {
+            mProviderMap.putProviderByClass(comp, cpr);
+        }
+        mProviderMap.putProviderByName(name, cpr);
+        conn = incProviderCountLocked(r, cpr, token, callingUid, callingPackage, callingTag,
+                                      stable, false, startTime, mService.mProcessList, expectedUserId);
+        if (conn != null) {
+            conn.waiting = true;
+        }
+    }
+
+
+    final long timeout =SystemClock.uptimeMillis() + ContentResolver.CONTENT_PROVIDER_READY_TIMEOUT_MILLIS;
+    boolean timedOut = false;
+     synchronized (cpr) {
+         while (cpr.provider == null) {
+             final long wait = Math.max(0L, timeout - SystemClock.uptimeMillis());
+             if (conn != null) {
+                 conn.waiting = true;
+             }
+             cpr.wait(wait);
+             if (cpr.provider == null) {
+                 timedOut = true;
+                 break;
+             }
+         }
+     }
+    if (timedOut) {
+        return null;
+    }
+    return cpr.newHolder(conn, false);
 }
 ```
 
++ 注释1
++ 
+
+
+
+```java
+public boolean canRunHere(ProcessRecord app) {
+    return (info.multiprocess || info.processName.equals(app.processName))
+            && uid == app.info.uid;
+}
+```
