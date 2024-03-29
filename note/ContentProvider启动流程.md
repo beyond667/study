@@ -610,6 +610,135 @@ public abstract class ContentProvider implements ContentInterface, ComponentCall
 }
 ```
 
-由于getIContentProvider返回的是Transport，这里调用的Transport.query，在注释1处调用外部类的query，即我们自定义的ContentProvider的query方法。其他增删改查类似。到这里整个流程就结束了。
+由于getIContentProvider返回的是Transport，这里调用的Transport.query，在注释1处调用外部类的query，即我们自定义的ContentProvider的query方法。其他增删改查类似。到这里ContentProvider的启动流程就结束了。
 
-#### 总结
+##### ContentProvider共享内存的原理
+
+关于共享内存的原理可以参照[共享内存](https://github.com/beyond667/study/blob/master/note/%E5%85%B1%E4%BA%AB%E5%86%85%E5%AD%98.md) ，这里关注ContentProvider在数据传输时是怎么共享内存的。
+
+由上文可只，客户端启动流程中拿到服务端的代理类IContentProvider，并调用代理类的query，代理类实际是ContentProviderProxy，我们从代理类的query开始看
+
+>```
+>frameworks/base/core/java/android/content/ContentProviderNative.java
+>```
+
+```java
+abstract public class ContentProviderNative extends Binder implements IContentProvider {
+    final class ContentProviderProxy implements IContentProvider{
+        public Cursor query(AttributionSource attributionSource, Uri url...){
+            //初始化BulkCursorToCursorAdaptor
+            BulkCursorToCursorAdaptor adaptor = new BulkCursorToCursorAdaptor();
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            attributionSource.writeToParcel(data, 0);
+            url.writeToParcel(data, 0);
+
+            //1 把上面初始化的BulkCursorToCursorAdaptor的IContentObserver塞到data里
+            data.writeStrongBinder(adaptor.getObserver().asBinder());
+			//2 binder通信传到服务端
+            mRemote.transact(IContentProvider.QUERY_TRANSACTION, data, reply, 0);
+
+            if (reply.readInt() != 0) {
+                //3 服务端拿到BulkCursorDescriptor，并调用BulkCursorToCursorAdaptor.initialize实例化本地对象
+                BulkCursorDescriptor d = BulkCursorDescriptor.CREATOR.createFromParcel(reply);
+                Binder.copyAllowBlocking(mRemote, (d.cursor != null) ? d.cursor.asBinder() : null);
+                adaptor.initialize(d);
+            } else {
+                adaptor.close();
+                adaptor = null;
+            }
+            return adaptor;
+        }
+    }
+}
+```
+
++ 注释1把上面初始化的BulkCursorToCursorAdaptor的IContentObserver塞到data里
++ 注释2通过binder调用服务端
++ 注释3 从服务端拿到BulkCursorDescriptor，并调用BulkCursorToCursorAdaptor.initialize实例化其对象
+
+再看服务端通过binder收到其请求
+
+> frameworks/base/core/java/android/content/ContentProviderNative.java
+
+```java
+public boolean onTransact(int code, Parcel data, Parcel reply, int flags){
+    //...
+    case QUERY_TRANSACTION:
+    {
+        //...
+        Uri url = Uri.CREATOR.createFromParcel(data);
+        //拿客户端传过来的IContentObserver binder对象
+        IContentObserver observer = IContentObserver.Stub.asInterface(data.readStrongBinder());
+		//1 调用ContentProvider的query，拿到的数据放在Cursor里
+        Cursor cursor = query(attributionSource, url, projection, queryArgs,cancellationSignal);
+
+        if (cursor != null) {
+            CursorToBulkCursorAdaptor adaptor = null;
+
+            //2 服务端也创建个CursorToBulkCursorAdaptor把结果和客户端的IContentObserver关联起来
+            adaptor = new CursorToBulkCursorAdaptor(cursor, observer,getProviderName());
+            cursor = null;
+
+            //3 关键步骤，获取BulkCursorDescriptor并写进reply返回客户端
+            BulkCursorDescriptor d = adaptor.getBulkCursorDescriptor();
+            adaptor = null;
+
+            reply.writeNoException();
+            reply.writeInt(1);
+            d.writeToParcel(reply, Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
+            //...
+            return true;
+        }
+    }
+
+}
+```
+
++ 注释1调用我们自定义的ContentProvider的query方法，把结果放进cursor
++ 注释2服务端也创建个CursorToBulkCursorAdaptor把结果和客户端的IContentObserver关联起来
++ 3 关键步骤，获取BulkCursorDescriptor，这里会真正创建共享内存
+
+>frameworks/base/core/java/android/database/CursorToBulkCursorAdaptor.java
+
+```java
+public BulkCursorDescriptor getBulkCursorDescriptor() {
+    synchronized (mLock) {
+        BulkCursorDescriptor d = new BulkCursorDescriptor();
+        d.cursor = this;
+        d.columnNames = mCursor.getColumnNames();
+        d.wantsAllOnMoveCalls = mCursor.getWantsAllOnMoveCalls();
+        //1 调用cursor.getCount这里会保证CursorWindow不为空
+        d.count = mCursor.getCount();
+        //2 这里的CursorWindow一定不为空
+        d.window = mCursor.getWindow();
+        if (d.window != null) {
+            d.window.acquireReference();
+        }
+        return d;
+    }
+}
+```
+
+这块代码表面看会疑惑，注释2 getWindow拿到的CursorWindow是在什么时候初始化的？具体看注释1的实现SQLiteCursor。
+
+> frameworks/base/core/java/android/database/sqlite/SQLiteCursor
+
+```java
+public class SQLiteCursor extends AbstractWindowedCursor {
+    public int getCount() {
+        if (mCount == NO_COUNT) {
+            fillWindow(0);
+        }
+        return mCount;
+    }
+    private void fillWindow(int requiredPos) {
+        //1 没初始化CursorWindow就先初始化，已经初始化过就clear下
+        clearOrCreateWindow(getDatabase().getPath());
+        //2 往
+		mCount = mQuery.fillWindow(mWindow, requiredPos, requiredPos, true);
+
+    }
+}
+```
+
