@@ -680,12 +680,13 @@ public boolean onTransact(int code, Parcel data, Parcel reply, int flags){
             adaptor = new CursorToBulkCursorAdaptor(cursor, observer,getProviderName());
             cursor = null;
 
-            //3 关键步骤，获取BulkCursorDescriptor并写进reply返回客户端
+            //3 关键步骤，获取BulkCursorDescriptor
             BulkCursorDescriptor d = adaptor.getBulkCursorDescriptor();
             adaptor = null;
 
             reply.writeNoException();
             reply.writeInt(1);
+            //4 把结果写进reply返回客户端
             d.writeToParcel(reply, Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
             //...
             return true;
@@ -696,8 +697,9 @@ public boolean onTransact(int code, Parcel data, Parcel reply, int flags){
 ```
 
 + 注释1调用我们自定义的ContentProvider的query方法，把结果放进cursor
-+ 注释2服务端也创建个CursorToBulkCursorAdaptor把结果和客户端的IContentObserver关联起来
-+ 3 关键步骤，获取BulkCursorDescriptor，这里会真正创建共享内存
++ 注释2服务端也创建个CursorToBulkCursorAdaptor把结果和客户端的IContentObserver关联起来，这里并未真正执行查询，只是构建了查询对象
++ 3 关键步骤，获取BulkCursorDescriptor，这里会真正创建共享内存并真正执行查询，结果会放进共享内存
++ 4 把查询结果写进reply返回客户端
 
 >frameworks/base/core/java/android/database/CursorToBulkCursorAdaptor.java
 
@@ -722,7 +724,7 @@ public BulkCursorDescriptor getBulkCursorDescriptor() {
 
 这块代码表面看会疑惑，注释2 getWindow拿到的CursorWindow是在什么时候初始化的？具体看注释1的实现SQLiteCursor。
 
-> frameworks/base/core/java/android/database/sqlite/SQLiteCursor
+> frameworks/base/core/java/android/database/sqlite/SQLiteCursor.java
 
 ```java
 public class SQLiteCursor extends AbstractWindowedCursor {
@@ -735,10 +737,313 @@ public class SQLiteCursor extends AbstractWindowedCursor {
     private void fillWindow(int requiredPos) {
         //1 没初始化CursorWindow就先初始化，已经初始化过就clear下
         clearOrCreateWindow(getDatabase().getPath());
-        //2 往
+        //2 这里才是真正执行查询结果，并把结果fill进CursorWindow的共享内存里
 		mCount = mQuery.fillWindow(mWindow, requiredPos, requiredPos, true);
+
+    }
+    protected void clearOrCreateWindow(String name) {
+        if (mWindow == null) {
+            mWindow = new CursorWindow(name);
+        } else {
+            mWindow.clear();
+        }
+    }
+}
+```
+
+注释1会保证一定有CursorWindow，那我们继续看这个关键类CursorWindow
+
+> frameworks/base/core/java/android/database/CursorWindow.java
+
+```java
+public class CursorWindow extends SQLiteClosable implements Parcelable {
+    public CursorWindow(String name) {
+        this(name, getCursorWindowSize());
+    }
+    public CursorWindow(String name, @BytesLong long windowSizeBytes) {
+        mStartPos = 0;
+        mName = name != null && name.length() != 0 ? name : "<unnamed>";
+        mWindowPtr = nativeCreate(mName, (int) windowSizeBytes);
+    }
+    public long mWindowPtr;
+    private static native long nativeCreate(String name, int cursorWindowSize);
+}
+```
+
+调用JNI的方法nativeCreate去创建JNI层的CursorWindow对象，把地址存起来，后面的其他操作直接把地址传递给jni即可完成相应操作。
+
+> framework/base/core/jni/android_database_CursorWindow.cpp
+
+```c++
+static jlong nativeCreate(JNIEnv* env, jclass clazz, jstring nameObj, jint cursorWindowSize) {
+    status_t status;
+    String8 name;
+    CursorWindow* window;
+
+    const char* nameStr = env->GetStringUTFChars(nameObj, NULL);
+    name.setTo(nameStr);
+    env->ReleaseStringUTFChars(nameObj, nameStr);
+	//1 CursorWindow::create创建JNI层的CursorWindow对象
+    status = CursorWindow::create(name, cursorWindowSize, &window);
+
+    return reinterpret_cast<jlong>(window);
+}
+```
+
+根据注释1CursorWindow::create创建JNI层的CursorWindow对象
+
+> framworks/base/libs/androidfw/CursorWindow.cpp
+
+```c++
+status_t CursorWindow::create(const String8 &name, size_t inflatedSize, CursorWindow **outWindow) {
+    *outWindow = nullptr;
+    CursorWindow* window = new CursorWindow();
+
+    window->mName = name;
+    window->mSize = std::min(kInlineSize, inflatedSize);
+    window->mInflatedSize = inflatedSize;
+
+    window->mData = malloc(window->mSize);
+    window->mReadOnly = false;
+    window->clear();
+    window->updateSlotsData();
+    *outWindow = window;
+    return OK;
+
+}
+
+status_t CursorWindow::alloc(size_t size, uint32_t* outOffset) {
+	//...
+    maybeInflate();
+	//...
+    return OK;
+}
+
+
+status_t CursorWindow::maybeInflate() {
+    int ashmemFd = 0;
+    void* newData = nullptr;
+
+    String8 ashmemName("CursorWindow: ");
+    ashmemName.append(mName);
+	//1 创建共享内存的文件描述符
+    ashmemFd = ashmem_create_region(ashmemName.string(), mInflatedSize);
+	//2 加载到内存
+    newData = ::mmap(nullptr, mInflatedSize, PROT_READ | PROT_WRITE, MAP_SHARED, ashmemFd, 0);
+    if (newData == MAP_FAILED) {
+        goto fail_silent;
+    }
+
+    //...
+    mAshmemFd = ashmemFd;
+    LOG(DEBUG) << "Inflated: " << this->toString();
+    return OK;
+}
+```
+
+由上面可以看到JNI层创建了个CursorWindow对象，并申请了共享内存fd，ContentProvider共享内存即通过此fd实现的。这里只是申请了共享内存空间，此时还没塞数据，后面mQuery.fillWindow会把查到的数据放进共享内存。这里简单看下调用流程，暂不关注怎么查数据，只关注数据传输
+
+```java
+//SQLiteQuery.java 
+int fillWindow(CursorWindow window, int startPos, int requiredPos, boolean countAllRows) {
+    int numRows = getSession().executeForCursorWindow(getSql(), getBindArgs(),
+                                                      window, startPos, requiredPos, countAllRows, getConnectionFlags(),
+                                                      mCancellationSignal);
+    return numRows;
+ }
+//SQLiteSession.java
+public int executeForCursorWindow(String sql, Object[] bindArgs,
+            CursorWindow window, int startPos, int requiredPos, boolean countAllRows,
+            int connectionFlags, CancellationSignal cancellationSignal) {
+    return mConnection.executeForCursorWindow(sql, bindArgs,
+                    window, startPos, requiredPos, countAllRows,
+                    cancellationSignal); // might throw
+}
+// SQLiteConnection.java
+public int executeForCursorWindow(String sql, Object[] bindArgs,
+                                  CursorWindow window, int startPos, int requiredPos, boolean countAllRows,
+                                  CancellationSignal cancellationSignal) {
+    final long result = nativeExecuteForCursorWindow(
+        mConnectionPtr, statement.mStatementPtr, window.mWindowPtr,
+        startPos, requiredPos, countAllRows);
+}
+private static native long nativeExecuteForCursorWindow(long connectionPtr, long statementPtr, long windowPtr,
+                                                        int startPos, int requiredPos, boolean countAllRows);
+```
+
+直接看android_database_SQLiteConnection.cpp
+
+> framworks/base/core/jni/android_database_SQLiteConnection.cpp
+
+```cpp
+static jlong nativeExecuteForCursorWindow(JNIEnv* env, jclass clazz,jlong connectionPtr, jlong statementPtr, jlong windowPtr...) {
+	//...
+    while (!gotException && (!windowFull || countAllRows)) {
+         CopyRowResult cpr = copyRow(env, window, statement, numColumns, startPos, addedRows);
+    }
+}
+static CopyRowResult copyRow(JNIEnv* env, CursorWindow* window...) {
+    //...
+    for (int i = 0; i < numColumns; i++) {
+        int type = sqlite3_column_type(statement, i);
+        if (type == SQLITE_TEXT) {
+            status = window->putString(addedRows, i, text, sizeIncludingNull);
+        }else if (type == SQLITE_INTEGER) {
+            //...其他数据类型省略
+        }
+    }
+}
+```
+
+再看下CursorWindow.putString
+
+> framworks/base/libs/android_database_SQLiteConnection.cpp
+
+```c++
+status_t CursorWindow::putString(uint32_t row, uint32_t column, const char* value...) {
+    return putBlobOrString(row, column, value, sizeIncludingNull, FIELD_TYPE_STRING);
+}
+status_t CursorWindow::putBlobOrString(uint32_t row, uint32_t column,
+        const void* value, size_t size, int32_t type) {
+    FieldSlot* fieldSlot = getFieldSlot(row, column);
+    memcpy(offsetToPtr(offset), value, size);
+
+    fieldSlot = getFieldSlot(row, column);
+    fieldSlot->type = type;
+    fieldSlot->data.buffer.offset = offset;
+    fieldSlot->data.buffer.size = size;
+    return OK;
+}
+```
+
+数据并不是直接写到共享内存的，而是写到FieldSlot这个数据结构中，而FieldSlot就是保存在共享内存中。继续看BulkCursorDescriptor.writeToParcel把parcel数据写入共享内存
+
+> ```
+> frameworks/base/core/java/android/database/BulkCursorDescriptor.java
+> ```
+
+```java
+public CursorWindow window;
+public void writeToParcel(Parcel out, int flags) {
+    if (window != null) {
+        out.writeInt(1);
+        window.writeToParcel(out, flags);
+    } else {
+        out.writeInt(0);
+    }
+}
+//CursorWindow.java
+public void writeToParcel(Parcel dest, int flags) {
+    nativeWriteToParcel(mWindowPtr, dest);
+}
+private static native void nativeWriteToParcel(long windowPtr, Parcel parcel);
+private static native long nativeCreateFromParcel(Parcel parcel);
+```
+
+可以看到CursorWindow相当于对jni做了封装，干活的都是jni层的CursorWindow.cpp
+
+>framworks/base/libs/androidfw/CursorWindow.cpp
+
+```c++
+status_t CursorWindow::writeToParcel(Parcel* parcel) {
+    if (mAshmemFd != -1) {
+        if (parcel->writeDupFileDescriptor(mAshmemFd)) goto fail;
+    } 
+}
+```
+
+把parcel写进共享内存的文件描述符，到这里服务端数据已经准备好了。继续看客户端通过binder通信拿结果。我们从上文这里继续看客户端流程
+
+```java
+mRemote.transact(IContentProvider.QUERY_TRANSACTION, data, reply, 0);
+if (reply.readInt() != 0) {
+    //3 服务端拿到BulkCursorDescriptor，并调用BulkCursorToCursorAdaptor.initialize实例化本地对象
+    BulkCursorDescriptor d = BulkCursorDescriptor.CREATOR.createFromParcel(reply);
+    Binder.copyAllowBlocking(mRemote, (d.cursor != null) ? d.cursor.asBinder() : null);
+    adaptor.initialize(d);
+}
+```
+
+这里先把服务端的parcel数据转化成客户端的BulkCursorDescriptor
+
+```java
+public final class BulkCursorDescriptor implements Parcelable {
+    public static final @android.annotation.NonNull Parcelable.Creator<BulkCursorDescriptor> CREATOR =
+        new Parcelable.Creator<BulkCursorDescriptor>() {
+        @Override
+        public BulkCursorDescriptor createFromParcel(Parcel in) {
+            BulkCursorDescriptor d = new BulkCursorDescriptor();
+            d.readFromParcel(in);
+            return d;
+        }
+
+    };
+    
+    public void readFromParcel(Parcel in) {
+        cursor = BulkCursorNative.asInterface(in.readStrongBinder());
+        columnNames = in.readStringArray();
+        wantsAllOnMoveCalls = in.readInt() != 0;
+        count = in.readInt();
+        if (in.readInt() != 0) {
+            //1 获取服务端共享内存的CursorWindow
+            window = CursorWindow.CREATOR.createFromParcel(in);
+        }
+    }
+}
+```
+
+这里继续实例化CursorWindow
+
+```java
+public class CursorWindow extends SQLiteClosable implements Parcelable {
+    public static final @android.annotation.NonNull Parcelable.Creator<CursorWindow> CREATOR
+        = new Parcelable.Creator<CursorWindow>() {
+        public CursorWindow createFromParcel(Parcel source) {
+            return new CursorWindow(source);
+        }
+    };
+}
+private CursorWindow(Parcel source) {
+    mWindowPtr = nativeCreateFromParcel(source);
+    mName = nativeGetName(mWindowPtr);
+}
+private static native long nativeCreateFromParcel(Parcel parcel);
+```
+
+与上面服务端是通过nativeCreate创建不同的是，客户端是通过nativeCreateFromParcel，可以理解，客户端是拿服务端写的parcel数据
+
+```c++
+//android_database_CursorWindow.cpp
+static jlong nativeCreateFromParcel(JNIEnv* env, jclass clazz, jobject parcelObj) {
+    Parcel* parcel = parcelForJavaObject(env, parcelObj);
+
+    CursorWindow* window;
+    status_t status = CursorWindow::createFromParcel(parcel, &window);
+    return reinterpret_cast<jlong>(window);
+}
+
+status_t CursorWindow::createFromParcel(Parcel* parcel, CursorWindow** outWindow) {
+    CursorWindow* window = new CursorWindow();
+    bool isAshmem;
+    if (parcel->readBool(&isAshmem)) goto fail;
+    if (isAshmem) {
+        //1 读服务端传过来的共享内存的fd
+        window->mAshmemFd = parcel->readFileDescriptor();
+        window->mAshmemFd = ::fcntl(window->mAshmemFd, F_DUPFD_CLOEXEC, 0);
+		//2 加载到客户端的内存空间
+        window->mData = ::mmap(nullptr, window->mSize, PROT_READ, MAP_SHARED, window->mAshmemFd, 0);
 
     }
 }
 ```
+
+这里拿到服务端传来的共享内存的fd，其实这里跟服务端的fd并不是同一个对象，而是其拷贝，这两个fd指向的是同一个文件描述，后面客户端对此共享内存的数据就可以做操作了。到这里ContentProvider的共享内存就结束了。另外，如果要两个进程传输file文件，android默认提供了FileProvider来进程间传输文件，本质也是基于共享内存实现的。
+
+#### 总结
+
+ContentProvider进程间通信还是基于binder，相对于其它三大组件，其主要负责数据在不同进程间的共享。客户端先尝试拿服务端的代理对象 IContentProvider，如果ContentProvider不存在，会先判断是不是只用在当前进程启动，而不用拉起服务端进程。需要拉服务端进程时，ContentProvider的onCreate会先于Application的onCreate。
+
+ContentProvider能实现共享内存的原理是服务端在JNI层把查到的数据存到共享内存中，并通过binder通信把fd传递到客户端进程，客户端在jni层把拿到的fd后也创建一块共享内存，后续客户端就可以对其进程增删改查操作。
+
+
 
