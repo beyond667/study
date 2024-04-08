@@ -11,9 +11,9 @@ HashMap和ArrayMap都是实现的Map接口，SparseArray原理和ArrayMap大部�
 |数据结构|1.8之前是数组+单链表，1,8之后再加红黑树（链表长度大于8变树，树长度减少到6时变回单链表）|两个数组，一个数组存key的hash值（从小到大排序），一个存key和value|两个数组，一个存key（从小到大排序），一个存value|
 |操作复杂度|理想状态下1，在数组上直接查到，单链表上是n,红黑树是logN|在key的列表二分法查找，logN|同ArrayMap|
 |默认长度|16|0|10|
-|扩容时机|大于size*0.75（加载因子默认0.75），并且数组长度大于等于64| 插入时数组已满|同ArrayMap|
-|扩容机制|乘2|0>4>8>之后一次扩0.5倍即>12>18>27（类似ArrayList，不过其第一次是0>10）|同ArrayMap|
-|缩容时机 | 不能缩容，假如数组长度32，就算把数据删完长度也不会变为16 | 数组长度大于8，删除时使用的空间小于1/3即缩容，缩小到原来的2/3 | 同ArrayMap|
+|扩容时机|大于size*0.75（加载因子默认0.75），并且数组长度大于等于64| 插入时数组已满| 插入时数组已满                                   |
+|扩容机制|乘2|0>4>8>之后一次扩0.5倍即>12>18>27>40>60（类似ArrayList，不过其第一次是0>10）|乘2|
+|缩容时机 | 不能缩容，假如数组长度32，就算把数据删完长度也不会变为16 | 数组长度大于8，删除时使用的空间小于1/3即缩容，已用的大于8，缩小到已用的1.5倍，否则缩小到8 | 不能缩容 |
 |使用场景|数据量大或者需要高效查询，但是消耗更多内存|数据小于1000，且对内存占用要求较高|同ArrayMap，且key是int时|
 
 #### HashMap
@@ -376,4 +376,418 @@ final void split(HashMap<K,V> map, Node<K,V>[] tab, int index, int bit) {
 这里可以看到在扩容时如果链表长度小于等于6就会进行树变链表。
 
 #### ArrayMap
+
+为了解决HashMap占内存的弊端，Android专门提供了内存效率更高的ArrayMap。内部使用两个数组，一个记录key的hash值（按序排列），另一个数组记录key-value，其顺序和第一个数组一致，数据类似如下：
+
+mHashes: hashA-hashB-hashC
+
+mArray:keyA-valueA-keyB-valueB-keyC-valueC
+
+增删改查时先通过对mHashes进行二分查找，找到具体位置index，再在mArray数组里从2*index处进行相应操作。其数据结构相对于HashMap可以看到会小一些，比如HashMap的链表中会记录next节点，树结构会记录左右子树。ArrayMap的另一个优点是缓存机制。我们从源码上来看具体实现：
+
+> android/util/ArrayMap.java
+
+```java
+public final class ArrayMap<K, V> implements Map<K, V> {
+ private static final boolean CONCURRENT_MODIFICATION_EXCEPTIONS = true;
+    
+    private static final int BASE_SIZE = 4;  // 容量增量的最小值
+    private static final int CACHE_SIZE = 10; // 缓存数组的上限
+
+    static Object[] mBaseCache; //用于缓存大小为4的ArrayMap
+    static int mBaseCacheSize; //记录baseCache里已缓存的数量
+    static Object[] mTwiceBaseCache; //用于缓存大小为8的ArrayMap
+    static int mTwiceBaseCacheSize;//记录TwiceBaseCache里已缓存的数量
+
+    final boolean mIdentityHashCode;
+    int[] mHashes;         //由key的hashcode所组成的数组
+    Object[] mArray;       //由key-value对所组成的数组，是mHashes大小的2倍
+    int mSize;             //成员变量的个数
+    public ArrayMap() {
+        this(0, false);
+    }
+    public ArrayMap(int capacity, boolean identityHashCode) {
+        mIdentityHashCode = identityHashCode;
+        if (capacity < 0) {
+            mHashes = EMPTY_IMMUTABLE_INTS;
+            mArray = EmptyArray.OBJECT;
+        } else if (capacity == 0) {
+            mHashes = EmptyArray.INT;
+            mArray = EmptyArray.OBJECT;
+        } else {
+            allocArrays(capacity);
+        }
+        mSize = 0;
+    }
+}
+```
+
+根据其成员变量，可以看到其内部有两个对象数组，即两个缓冲池，一个缓存大小为4的Array，一个缓存大小为8的，并分别记录了这两个缓冲池的size。根据构造函数默认长度为0，也可以直接指定长度，并调用allocArrays去分配指定的长度的数组。
+
+先看数据插入：
+
+```java
+public V put(K key, V value) {
+    final int osize = mSize; // 当前 map 大小
+    final int hash;
+    int index;
+     // 如果 key 为 null，其 hashCode 算作 0
+    if (key == null) { 
+        hash = 0; 
+        index = indexOfNull();
+    } else {
+        //1 通过二分法在 mHashes 数组中查找值等于 hash 的 key
+        hash = mIdentityHashCode ? System.identityHashCode(key) : key.hashCode();
+        index = indexOf(key, hash); 
+    }
+    //2 index 大于等于 0 时，更新 key 对应 value 并返回旧值。
+    if (index >= 0) {
+        index = (index<<1) + 1;
+        final V old = (V)mArray[index];
+        mArray[index] = value;
+        return old;
+    }
+
+    index = ~index;
+    //否则说明是插入操作，当 osize >= mHashes.length 时进行扩容
+    if (osize >= mHashes.length) {
+        //3 扩容规则即0>4>8> n的1.5倍
+        final int n = osize >= (BASE_SIZE*2) ? (osize+(osize>>1))
+            : (osize >= BASE_SIZE ? (BASE_SIZE*2) : BASE_SIZE);
+
+        //4 先记录旧的数组，再通过allocArrays把这两个数组扩容
+        final int[] ohashes = mHashes;
+        final Object[] oarray = mArray;
+        allocArrays(n);
+        if (mHashes.length > 0) {
+            //5 将旧数组复制到新分配的数组 mHashes 和 mArray 中
+            System.arraycopy(ohashes, 0, mHashes, 0, ohashes.length);
+            System.arraycopy(oarray, 0, mArray, 0, oarray.length);
+        }
+        //6 释放掉旧数据的内存，如果旧数组长度为4或者8，会加进缓存池
+        freeArrays(ohashes, oarray, osize);
+    }
+    //7 当插入的位置不在数组末尾时，需要将 index 位置后的数据往后移动一位
+    if (index < osize) {
+        System.arraycopy(mHashes, index, mHashes, index + 1, osize - index);
+        System.arraycopy(mArray, index << 1, mArray, (index + 1) << 1, (mSize - index) << 1);
+    }
+
+    //8 完成数据插入，mSize 个数加1  
+    mHashes[index] = hash;
+    mArray[index<<1] = key;
+    mArray[(index<<1)+1] = value;
+    mSize++;
+    return null;
+}
+```
+
+上面注释已经写的很详细了。
+
++ 注释1如果key不为null，先通过二分法在 mHashes 数组中查找值等于 hash 的 key
++ 注释2如果能找到，直接在mArray数组的2n+1处赋值并返回
++ 注释3如果找不到index，说明是插入操作，需先判断是否需要扩容，需要的话走4 5 6
++ 注释4 5 6会先记录旧的数组，再通过allocArrays把原数组扩容，扩容时会先尝试容缓存拿，之后通过System.arraycopy拷贝到新的数组，最后在注释6释放原数组，释放时会放进缓存
++ 到注释7 8会真正插入进去，如果index不在队尾，先把index处以后的数据都往后移一位，再在mHashes数组的index处插入key的hash值，mArray的2 * index处插入key，2*index+1处插入value
+
+再看删除操作：
+
+```java
+public V remove(Object key) {
+    // 先二分法查找到具体的index
+    final int index = indexOfKey(key);
+    if (index >= 0) {
+        return removeAt(index);
+    }
+
+    return null;
+}
+public V removeAt(int index) {
+    final Object old = mArray[(index << 1) + 1];
+    final int osize = mSize;
+    final int nsize;
+    if (osize <= 1) {
+        //只剩1个 删除后为空
+        final int[] ohashes = mHashes;
+        final Object[] oarray = mArray;
+        mHashes = EmptyArray.INT;
+        mArray = EmptyArray.OBJECT;
+        freeArrays(ohashes, oarray, osize);
+        nsize = 0;
+    } else {
+        nsize = osize - 1;
+        //1 数组长度大于8并且已用的小于3分之一，进行缩容操作。缩小到原size的2/3
+        // 假如现在数组长度18，已用的5个，缩容后为8
+        // 假如现在数组长度是40，已用12个，缩容后为18
+        if (mHashes.length > (BASE_SIZE*2) && mSize < mHashes.length/3) {
+            final int n = osize > (BASE_SIZE*2) ? (osize + (osize>>1)) : (BASE_SIZE*2);
+            final int[] ohashes = mHashes;
+            final Object[] oarray = mArray;
+            allocArrays(n);
+
+            //2 需要缩容时先把index之前的copy到新数组 再把旧数组index+1后的移动到新数组的index之后
+            if (index > 0) {
+                System.arraycopy(ohashes, 0, mHashes, 0, index);
+                System.arraycopy(oarray, 0, mArray, 0, index << 1);
+            }
+            if (index < nsize) {
+                System.arraycopy(ohashes, index + 1, mHashes, index, nsize - index);
+                System.arraycopy(oarray, (index + 1) << 1, mArray, index << 1,
+                                 (nsize - index) << 1);
+            }
+        } else {
+            //3 不需要缩容的话直接移index+1后的到index处
+            if (index < nsize) {
+                System.arraycopy(mHashes, index + 1, mHashes, index, nsize - index);
+                System.arraycopy(mArray, (index + 1) << 1, mArray, index << 1,
+                                 (nsize - index) << 1);
+            }
+            mArray[nsize << 1] = null;
+            mArray[(nsize << 1) + 1] = null;
+        }
+    }
+    mSize = nsize;
+    return (V)old;
+}
+```
+
+删除操作类似，先通过二分法查到index，再看下是否需要缩容
+
++ 注释1 数组长度大于8，并且已用的不到1/3就缩容，缩容规则是如果已用的小于等于8，直接设置为8，否则缩小到已用的1.5倍
++ 注释2和3 需要缩容的话就先把index之前的移动到新数组，后面都会移动index+1之后的到index处
+
+##### ArrayMap缓存机制
+
+上面put操作需要扩容时先allocArrays分配内存，再freeArrays释放旧数组；
+
+删除操作需要缩容时也会allocArrays分配指定到的缩容的内存；
+
+构造函数中也可以传具体的长度，并通过allocArrays分配指定的长度。
+
+另外还有个场景会调用到：putAll，先ensureCapacity确保下一次插入多个需不需要扩容，需要的话就allocArrays先扩容，再freeArrays释放旧数组，之后for循环调用put。
+
+我们具体看下allocArrays（从缓存取）和freeArrays（释放旧数组时存缓存）
+
+先看freeArrays存
+
+```java
+private static final int CACHE_SIZE = 10;
+private static void freeArrays(final int[] hashes, final Object[] array, final int size) {
+    // 1 释放的数组长度为8
+    if (hashes.length == (BASE_SIZE*2)) {
+        synchronized (sTwiceBaseCacheLock) {
+            //当前缓存的小于10个才加进缓冲池，即最多缓冲10个
+            if (mTwiceBaseCacheSize < CACHE_SIZE) {
+                //2 缓存数组的第0个位置指向缓存池，第1个位置指向缓存的hash表
+                array[0] = mTwiceBaseCache;
+                array[1] = hashes;
+                //3 缓存数组的第2-n全部置空
+                for (int i=(size<<1)-1; i>=2; i--) {
+                    array[i] = null;
+                }
+                //4 缓冲池指向传进来的数组，长度加1
+                mTwiceBaseCache = array;
+                mTwiceBaseCacheSize++;
+            }
+        }
+    } else if (hashes.length == BASE_SIZE) {
+        //长度为4的类似上面
+        //...
+    }
+}
+```
+
++ 注释1 释放时可以看到，只会缓存长度为4和8的数组，并且最多各缓存10个
++ 注释2和3 把要缓存的数组的第0个位置指向原缓冲池，第一个数组指向hash的数组，后面的全部置空
++ 注释4再把缓冲池指向新缓冲的数组
+
+![freeArrays存缓存](img/arraymap缓存.png)
+
+再看allocArrays分配数组
+```java
+private void allocArrays(final int size) {
+    // 分配数组长度为8
+    if (size == (BASE_SIZE*2)) {
+        synchronized (sTwiceBaseCacheLock) {
+            if (mTwiceBaseCache != null) {
+                final Object[] array = mTwiceBaseCache;
+                //1 从缓冲池取出 赋值给mArray
+                mArray = array;
+                try {
+                    //2 缓冲池指向其上一个缓存
+                    mTwiceBaseCache = (Object[]) array[0];
+                    //3 从缓冲池取出mHashes
+                    mHashes = (int[]) array[1];
+                    //4 mHashes不为空的话，把array的第0和1个位置都置空，缓存长度-1
+                    if (mHashes != null) {
+                        array[0] = array[1] = null;
+                        mTwiceBaseCacheSize--;
+                        return;
+                    }
+                } catch (ClassCastException e) {}
+                //5 托底措施，正常情况下不会走到这里，走到的话就把缓存清空
+                mTwiceBaseCache = null;
+                mTwiceBaseCacheSize = 0;
+            }
+        }
+    } else if (size == BASE_SIZE) {
+        //分配长度为4，类似上面
+        //...
+    }
+
+    //长度非4和8的情况，直接赋值指定的长度的数组
+    mHashes = new int[size];
+    mArray = new Object[size<<1];
+}
+```
+取缓存的逻辑和存的基本是逆操作。
+
+注释1 2 3 4从缓冲池取出赋值给mArray，并把缓冲池指向其上个缓存，再把取出的第0和1置空。值得注意的是，这里在注释5处做了托底措施，如果有ClassCastException异常后，直接把缓冲池清空。![allocArrays取缓存](img/arraymap取缓存.png)
+
+#### SparseArray
+
+SparseArray与ArrayMap基本类似，区别是其key只能是int类型，如果是long类型的可以用Android提供的LongSparseArray。另外其内部一个数组存的是key，另一个是value，ArrayMap是一个数组存的是key的hashcode，另一个是key-value的数组。如果key是int类型的，推荐使用SparseArray，因为其减少了装箱的过程，并且其内部更省内存。
+
+```java
+public class LongSparseArray<E> implements Cloneable {
+    private int[] mKeys;
+    private Object[] mValues;
+    private int mSize;
+    public SparseArray() {
+        this(10);
+    }
+}
+```
+
+默认长度为10，看其put操作
+
+```java
+private static final Object DELETED = new Object();
+public void put(int key, E value) {
+    //1 二分查找key所在的位置
+    int i = ContainerHelpers.binarySearch(mKeys, mSize, key);
+    //位置大于等于0，说明已经存在了，直接赋值，否则插入
+    if (i >= 0) {
+        mValues[i] = value;
+    } else {
+        //2 取反得到待插入key的位置
+        i = ~i;
+		//如果该位置小于size，并且该位置的值被标记了DELETED,直接赋值返回
+        if (i < mSize && mValues[i] == DELETED) {
+            mKeys[i] = key;
+            mValues[i] = value;
+            return;
+        }
+
+        //3 mGarbage为true，说明有元素被删除了，如果mSize已经满了，此时先gc回收，再查找一遍
+        if (mGarbage && mSize >= mKeys.length) {
+            gc();
+            i = ~ContainerHelpers.binarySearch(mKeys, mSize, key);
+        }
+		//4 将插入位置之后的所有数据向后移动一位,如果数组空间不足还会开启扩容
+        mKeys = GrowingArrayUtils.insert(mKeys, mSize, i, key);
+        mValues = GrowingArrayUtils.insert(mValues, mSize, i, value);
+        mSize++;
+    }
+}
+```
+
++ 注释1 先通过ContainerHelpers.binarySearch查找key所在的位置，大于0说明查找到了，直接赋值
++ 注释2把注释1处查到到的取反，即是key要插入的位置，也侧面说明了ContainerHelpers.binarySearch方法如果查找不到，返回最合适位置的负值。如果该位置小于数组长度，并且该处数据被标记了DELETED，直接赋值返回
++ 注释3处如果mGarbage为true，说明有元素被删除了，如果mSize已经满了，此时先gc回收，再查找一遍
++ 注释4 将插入位置之后的所有数据向后移动一位,如果数组空间不足还会开启扩容
+
+```java
+class ContainerHelpers {
+    static int binarySearch(int[] array, int size, int value) {
+        int lo = 0;
+        int hi = size - 1;
+
+        while (lo <= hi) {
+            final int mid = (lo + hi) >>> 1;
+            final int midVal = array[mid];
+
+            if (midVal < value) {
+                lo = mid + 1;
+            } else if (midVal > value) {
+                hi = mid - 1;
+            } else {
+                return mid;  // value found
+            }
+        }
+        return ~lo;  // value not present
+    }
+}
+```
+
+这个二分查找也挺有意思，能找到具体指就返回正数的index，找不到就返回最合适的index的负数
+
+```java
+public final class GrowingArrayUtils {
+    public static <T> T[] insert(T[] array, int currentSize, int index, T element) {
+        assert currentSize <= array.length;
+
+        //插入后不超过array的长度，先把index后的全部后移一位，再在index处赋值
+        if (currentSize + 1 <= array.length) {
+            System.arraycopy(array, index, array, index + 1, currentSize - index);
+            array[index] = element;
+            return array;
+        }
+
+        //需要扩容2倍，扩容后把index前的copy到新数组，再把index处赋值，最后把老数组的index后的copy到新数组
+        T[] newArray = ArrayUtils.newUnpaddedArray((Class<T>)array.getClass().getComponentType(),
+                                                   growSize(currentSize));
+        System.arraycopy(array, 0, newArray, 0, index);
+        newArray[index] = element;
+        System.arraycopy(array, index, newArray, index + 1, array.length - index);
+        return newArray;
+    }
+     public static int growSize(int currentSize) {
+        return currentSize <= 4 ? 8 : currentSize * 2;
+    }
+}   
+```
+
+插入操作类似，默认小于等于4扩容到8，否则扩2倍
+
+再看remove操作
+
+```java
+public void remove(int key) {
+    delete(key);
+}
+public void delete(int key) {
+    int i = ContainerHelpers.binarySearch(mKeys, mSize, key);
+
+    if (i >= 0) {
+        if (mValues[i] != DELETED) {
+            mValues[i] = DELETED;
+            mGarbage = true;
+        }
+    }
+}
+```
+
+删除也很简单，先二分查到位置，再把该位置标记为DELETED，并且mGarbage设为true
+
+另外，正常情况下，如果确定要添加的位置在最后，最好调用append，这样效率最高，不用二分查找。
+
+```java
+public void append(int key, E value) {
+    if (mSize != 0 && key <= mKeys[mSize - 1]) {
+        put(key, value);
+        return;
+    }
+
+    if (mGarbage && mSize >= mKeys.length) {
+        gc();
+    }
+
+    mKeys = GrowingArrayUtils.append(mKeys, mSize, key);
+    mValues = GrowingArrayUtils.append(mValues, mSize, value);
+    mSize++;
+}
+```
+
+可以看到append时也会与数组最后一个比较下，如果小的话还是走put操作，否则直接插入到最后。
 
