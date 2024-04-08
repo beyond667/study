@@ -24,8 +24,7 @@ Android  <img width=600/>|
 
 数据结构  <img width=600/>|
 ---|
-[HashMap](https://github.com/beyond667/study/blob/master/note/LeakCanary%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86.md)
-[ArrayMap/SparseArray](https://github.com/beyond667/study/blob/master/note/LeakCanary%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86.md)
+[HashMap/ArrayMap/SparseArray](https://github.com/beyond667/study/blob/master/note/HashMap%E5%92%8CArrayMap%E5%92%8CSparseArray.md)
 
 
 第三方  <img width=600/>|
