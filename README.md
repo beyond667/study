@@ -12,6 +12,7 @@ Framework <img width=600/>|
 [深入理解AMS](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
 [深入理解PMS](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
 [深入理解WMS](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
+[深入理解Binder原理](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
 [编译Aosp](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
 [自定义系统服务](https://github.com/beyond667/study/blob/master/note/%E8%87%AA%E5%AE%9A%E4%B9%89%E7%B3%BB%E7%BB%9F%E6%9C%8D%E5%8A%A1.md) 
 [开机流程](https://github.com/beyond667/study/blob/master/note/%E5%BC%80%E6%9C%BA%E6%B5%81%E7%A8%8B.md) 
