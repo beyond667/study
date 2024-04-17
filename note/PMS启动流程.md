@@ -1,6 +1,176 @@
 #### 前言
 
-PMS是android系统很重要的一个系统服务，主要负责管理应用的安装，卸载，更新，查询。我们在四大组件的启动流程中都看到PMS的身影，比如通过Intent启动另一个应用时都会先通过PMS去获取该应用的PackageInfo信息。本文主要从两个方面分析PMS：PMS安装APP流程，PMS的启动和使用流程。本文基于Android13。
+PMS是android系统很重要的一个系统服务，主要负责管理应用的安装，卸载，更新，查询，权限管理。我们在四大组件的启动流程中都看到PMS的身影，比如通过Intent启动另一个应用时都会先通过PMS去获取该应用的PackageInfo信息。本文主要从两个方面分析PMS：PMS安装APP流程，PMS的启动和使用流程。本文基于Android13。
+
+#### PMS启动流程
+
+在[开机流程](https://github.com/beyond667/study/blob/master/note/Activity%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md)中已经分析过，PMS是在`SystemServer`的`startBootstrapServices()`里启动的，本文只关注跟PMS相关的。
+
+> frameworks/base/services/java/com/android/server/SystemServer.java
+
+```java
+private static final String ENCRYPTING_STATE = "trigger_restart_min_framework";
+private static final String ENCRYPTED_STATE = "1";
+private boolean mOnlyCore;
+
+private void startBootstrapServices(@NonNull TimingsTraceAndSlog t) {
+	//...
+    // Only run "core" apps if we're encrypting the device.
+    String cryptState = VoldProperties.decrypt().orElse("");
+    if (ENCRYPTING_STATE.equals(cryptState)) {
+        mOnlyCore = true;
+    } else if (ENCRYPTED_STATE.equals(cryptState)) {
+        mOnlyCore = true;
+    }
+    
+    IPackageManager iPackageManager;
+    Pair<PackageManagerService, IPackageManager> pmsPair = PackageManagerService.main(
+        mSystemContext, installer, domainVerificationService,
+        mFactoryTestMode != FactoryTest.FACTORY_TEST_OFF, mOnlyCore);
+    mPackageManagerService = pmsPair.first;
+    iPackageManager = pmsPair.second;
+	//...
+}
+```
+
+注意vold.decrypt属性值如果是1或者trigger_restart_min_framework，mOnlyCore就为true，代表不需扫描data分区。vold.decrypt是获取android磁盘的加密状态，默认是扫描data分区的。
+
+>frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+
+```java
+public static Pair<PackageManagerService, IPackageManager> main(Context context,Installer installer, @NonNull DomainVerificationService domainVerificationService,boolean factoryTest, boolean onlyCore) {
+
+    //1 构建注射器，里面传了PMS构造函数中需要的对象
+    PackageManagerServiceInjector injector = new PackageManagerServiceInjector(
+        context, lock, installer, installLock, new PackageAbiHelperImpl(),
+        backgroundHandler,
+        (i, pm) -> PermissionManagerService.create(context,
+                                                   i.getSystemConfig().getAvailableFeatures()),
+        (i, pm) -> new Settings(Environment.getDataDirectory(),
+                                RuntimePermissionsPersistence.createInstance(),
+                                i.getPermissionManagerServiceInternal(),
+                                domainVerificationService, backgroundHandler, lock),
+        //...
+    );
+    //2 直接new PackageManagerService创建实例
+    PackageManagerService m = new PackageManagerService(injector, onlyCore, factoryTest,
+                                                        PackagePartitions.FINGERPRINT, Build.IS_ENG, Build.IS_USERDEBUG,
+                                                        Build.VERSION.SDK_INT, Build.VERSION.INCREMENTAL);
+
+    //3 通过PMS new出IPackageManagerImpl这个binder对象，以key为“package”添加到系统服务中
+    IPackageManagerImpl iPackageManager = m.new IPackageManagerImpl();
+    ServiceManager.addService("package", iPackageManager);
+    final PackageManagerNative pmn = new PackageManagerNative(m);
+    ServiceManager.addService("package_native", pmn);
+    LocalManagerRegistry.addManager(PackageManagerLocal.class, m.new PackageManagerLocalImpl());
+    return Pair.create(m, iPackageManager);
+}
+```
+
++ 注释1处先创建了个注射器，里面塞了很多PMS初始化时需要的资源，比如权限管理的服务PermissionManagerService，协助PMS保存应用信息的Settings等等。
++ 注释2把注释1的注射器传到PMS的构造函数中，new出实例
++ 注释3由于PMS并没继承Binder，所以其并不是binder对象，通过m.new IPackageManagerImpl初始化binder对象，并绑定到以key为`package`的系统服务中
+
+注释1里有个new Settings
+
+> frameworks/base/services/core/java/com/android/server/pm/Settings.java
+
+```java
+Settings(File dataDir...)  {
+    mSystemDir = new File(dataDir, "system");
+    mSystemDir.mkdirs();
+	//记录系统所有安装的apk的信息
+    mSettingsFilename = new File(mSystemDir, "packages.xml");
+    //packages.xml的备份文件
+    mBackupSettingsFilename = new File(mSystemDir, "packages-backup.xml");
+    //记录手机里所有app的简要信息，包括name、dataPath等
+    mPackageListFilename = new File(mSystemDir, "packages.list");
+    FileUtils.setPermissions(mPackageListFilename, 0640, SYSTEM_UID, PACKAGE_INFO_GID);
+
+    final File kernelDir = new File("/config/sdcardfs");
+    mKernelMappingFilename = kernelDir.exists() ? kernelDir : null;
+    //强制stop的apk信息  
+    mStoppedPackagesFilename = new File(mSystemDir, "packages-stopped.xml");
+    //packages-stopped的备份文件
+    mBackupStoppedPackagesFilename = new File(mSystemDir, "packages-stopped-backup.xml");
+
+    registerObservers();
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #### adb install流程
 
@@ -237,4 +407,3 @@ private int doRunInstall(final InstallParams params) throws RemoteException{
 这里通过doCreateSession和doCommitSession跟PackageInstall交互，通过PackageInstall去真正走安装流程。这个我们在PMS安装流程里具体看。
 
 总的来说，adb install命令会先在adb进程构建服务端执行的shell语句后通过socket传给shell进程执行，shell进程执行cmd package 指令后获取指定的服务，比如PMS，并通过binder机制调用其shellCommand，最终再根据传的adb后面的参数，比如install/uninstall执行相应的安装/卸载。
-
