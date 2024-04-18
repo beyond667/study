@@ -79,7 +79,7 @@ public static Pair<PackageManagerService, IPackageManager> main(Context context,
 Settings(File dataDir...)  {
     mSystemDir = new File(dataDir, "system");
     mSystemDir.mkdirs();
-	//记录系统所有安装的apk的信息
+	//记录系统所有安装的apk的信息，包括permission，name，flags，version等
     mSettingsFilename = new File(mSystemDir, "packages.xml");
     //packages.xml的备份文件
     mBackupSettingsFilename = new File(mSystemDir, "packages-backup.xml");
@@ -98,9 +98,96 @@ Settings(File dataDir...)  {
 }
 ```
 
+这个Settings不是我们常用的provider下的Settings，而是协助PMS保存APK的信息的类，比较重要的是packages.xml和packages.list文件，分别记录所有应用的详细和简略信息。任何应用的更改，包括权限，安装卸载更新等都会写入到packages.xml中，写入之前会先把packages.xml拷贝一份为packages-backup.xml，写入成功后删除备份文件，下次写入时如果有备份文件，则说明之前写入有异常，就会重新使用packages-backup.xml备份文件。配置文件里面具体内容参考[packages.xml和packages.list全解析](https://zhuanlan.zhihu.com/p/31124919)
 
+继续看PMS的构造函数，由于较长，分开来看
 
+```java
+//frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+public PackageManagerService(PackageManagerServiceInjector injector...) {
+    mInjector = injector;
+    mContext = injector.getContext();
+    mSettings = injector.getSettings();
+    //...
+    mSettings.addSharedUserLPw("android.uid.system", Process.SYSTEM_UID/*1000*/,
+                               ApplicationInfo.FLAG_SYSTEM,ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.phone", RADIO_UID/*1001*/,ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.log", LOG_UID/*1007*/,
+                               ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.nfc", NFC_UID/*1027*/,
+                               ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.bluetooth", BLUETOOTH_UID/*1002*/,
+                               ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.shell", SHELL_UID/*2000*/,
+                               ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.se", SE_UID,
+                               ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.networkstack", NETWORKSTACK_UID,
+                               ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    mSettings.addSharedUserLPw("android.uid.uwb", UWB_UID,
+                               ApplicationInfo.FLAG_SYSTEM, ApplicationInfo.PRIVATE_FLAG_PRIVILEGED);
+    
+    //...
+}
 
+//frameworks/base/services/core/java/com/android/server/pm/Settings.java
+SharedUserSetting addSharedUserLPw(String name, int uid, int pkgFlags, int pkgPrivateFlags) {
+    //1 settings里用mSharedUsers了所有的shareuser信息
+    SharedUserSetting s = mSharedUsers.get(name);
+    if (s != null) {
+        if (s.mAppId == uid) {
+            return s;
+        }
+        return null;
+    }
+    s = new SharedUserSetting(name, pkgFlags, pkgPrivateFlags);
+    s.mAppId = uid;
+    if (mAppIds.registerExistingAppId(uid, s, name)) {
+        mSharedUsers.put(name, s);
+        return s;
+    }
+    return null;
+}
+
+//frameworks/base/services/core/java/com/android/server/pm/AppIdSettingMap.java
+/**
+* We use an ArrayList instead of an SparseArray for non system apps because the number of apps
+* might be big, and only ArrayList gives us a constant lookup time.
+*/
+private final WatchedArrayList<SettingBase> mNonSystemSettings;
+private final WatchedSparseArray<SettingBase> mSystemSettings;
+public boolean registerExistingAppId(int appId, SettingBase setting, Object name) {
+    //2 pid大于10000即为非系统应用
+    if (appId >= Process.FIRST_APPLICATION_UID) {
+        int size = mNonSystemSettings.size();
+        //先减去10000算出非系统应用的index
+        final int index = appId - Process.FIRST_APPLICATION_UID;
+        //如果index已经大于非缓存的size，直接添加缺少的size进去，因为用的是数组存的，为了方便后面的根据index查找
+        while (index >= size) {
+            mNonSystemSettings.add(null);
+            size++;
+        }
+        //如果相应的index处已经存了，说明之前已经添加过了直接返回false
+        if (mNonSystemSettings.get(index) != null) {
+            return false;
+        }
+        //否则把此SharedUserSetting添加到非系统缓存列表中
+        mNonSystemSettings.set(index, setting);
+    } else {
+        //系统的同理，只不过系统的用的是sparseArray，不需要像非系统的数组一样，在中间塞一堆空对象
+        if (mSystemSettings.get(appId) != null) {
+            return false;
+        }
+        mSystemSettings.put(appId, setting);
+    }
+    return true;
+}
+```
+
+首先从构造器里获取需要的各种资源，比如settings。然后通过addSharedUserLPw把android.uid.system/phone/log/shell等这9个系统默认的sharedUserId添加到settings里。这里牵涉到共享用户id的概念，具有相同sharedUserId的应用具有相同的权限，并且共用同一个uid。比如我们的系统应用在AndroidManifest中配置了`android:sharedUserId="android.uid.system"`，那个该应用就认为是系统应用，并且其uid即为android.uid.system（1000）。
+
++ 注释1在settings.addSharedUserLPw方法里缓存了所有的sharedUser信息，如果第一次添加就new个新的SharedUserSetting，并调用AppIdSettingMap.registerExistingAppId来注册
++ 注释2处对应pid大于10000的即为非系统应用，把注释1new的SharedUserSetting添加到非系统应用的缓存中，系统应用同理。注意这里系统应用和非系统应用的缓存用了两种数据结构，上面英文注释也写的很清楚，非系统应用用的ArrayList而不是SpareseArray，因为非系统应用数量可能会很多，在[HashMap/ArrayMap/SparseArray](https://github.com/beyond667/study/blob/master/note/HashMap%E5%92%8CArrayMap%E5%92%8CSparseArray.md)中我们知道ArrayMap和SparseArray比较适用于数据量小于1000的情况
 
 
 
