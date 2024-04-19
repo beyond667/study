@@ -1,6 +1,6 @@
 #### 前言
 
-PMS是android系统很重要的一个系统服务，主要负责管理应用的安装，卸载，更新，查询，权限管理。我们在四大组件的启动流程中都看到PMS的身影，比如通过Intent启动另一个应用时都会先通过PMS去获取该应用的PackageInfo信息。本文主要从两个方面分析PMS：PMS安装APP流程，PMS的启动和使用流程。本文基于Android13。
+PMS是android系统很重要的一个系统服务，主要负责管理应用的安装，卸载，更新，查询，权限管理。我们在四大组件的启动流程中都看到PMS的身影，比如通过Intent启动另一个应用时都会先通过PMS去获取该应用的PackageInfo信息。本文主要从两个方面分析PMS：PMS安装APP流程，PMS的启动和使用流程。代码基于Android13。
 
 #### PMS启动流程
 
@@ -50,6 +50,7 @@ public static Pair<PackageManagerService, IPackageManager> main(Context context,
                                 RuntimePermissionsPersistence.createInstance(),
                                 i.getPermissionManagerServiceInternal(),
                                 domainVerificationService, backgroundHandler, lock),
+        (i, pm) -> SystemConfig.getInstance(),
         //...
     );
     //2 直接new PackageManagerService创建实例
@@ -67,11 +68,13 @@ public static Pair<PackageManagerService, IPackageManager> main(Context context,
 }
 ```
 
-+ 注释1处先创建了个注射器，里面塞了很多PMS初始化时需要的资源，比如权限管理的服务PermissionManagerService，协助PMS保存应用信息的Settings等等。
++ 注释1处先创建了个注射器，里面塞了很多PMS初始化时需要的资源，比如权限管理的服务PermissionManagerService，协助PMS保存应用信息的Settings，系统全局的配置信息SystemConfig等等。
 + 注释2把注释1的注射器传到PMS的构造函数中，new出实例
 + 注释3由于PMS并没继承Binder，所以其并不是binder对象，通过m.new IPackageManagerImpl初始化binder对象，并绑定到以key为`package`的系统服务中
 
-注释1里有个new Settings
+先具体看下注释1里 的Settings和SystemConfig
+
+##### 准备Settings
 
 > frameworks/base/services/core/java/com/android/server/pm/Settings.java
 
@@ -187,13 +190,239 @@ public boolean registerExistingAppId(int appId, SettingBase setting, Object name
 首先从构造器里获取需要的各种资源，比如settings。然后通过addSharedUserLPw把android.uid.system/phone/log/shell等这9个系统默认的sharedUserId添加到settings里。这里牵涉到共享用户id的概念，具有相同sharedUserId的应用具有相同的权限，并且共用同一个uid。比如我们的系统应用在AndroidManifest中配置了`android:sharedUserId="android.uid.system"`，那个该应用就认为是系统应用，并且其uid即为android.uid.system（1000）。
 
 + 注释1在settings.addSharedUserLPw方法里缓存了所有的sharedUser信息，如果第一次添加就new个新的SharedUserSetting，并调用AppIdSettingMap.registerExistingAppId来注册
-+ 注释2处对应pid大于10000的即为非系统应用，把注释1new的SharedUserSetting添加到非系统应用的缓存中，系统应用同理。注意这里系统应用和非系统应用的缓存用了两种数据结构，上面英文注释也写的很清楚，非系统应用用的ArrayList而不是SpareseArray，因为非系统应用数量可能会很多，在[HashMap/ArrayMap/SparseArray](https://github.com/beyond667/study/blob/master/note/HashMap%E5%92%8CArrayMap%E5%92%8CSparseArray.md)中我们知道ArrayMap和SparseArray比较适用于数据量小于1000的情况
++ 注释2处对pid大于10000的即为非系统应用，把注释1new的SharedUserSetting添加到非系统应用的缓存中，系统应用同理。注意这里系统应用和非系统应用的缓存用了两种数据结构，上面英文注释也写的很清楚，非系统应用用的ArrayList而不是SpareseArray，因为非系统应用数量可能会很多，在[HashMap/ArrayMap/SparseArray](https://github.com/beyond667/study/blob/master/note/HashMap%E5%92%8CArrayMap%E5%92%8CSparseArray.md)中我们知道ArrayMap和SparseArray比较适用于数据量小于1000的情况
 
+##### SystemConfig
 
+构建注射器时也通过getInstance初始化了SystemConfig
 
+>/frameworks/base/core/java/com/android/server/SystemConfig.java
 
+```java
+public static SystemConfig getInstance() {
+    synchronized (SystemConfig.class) {
+        if (sInstance == null) {
+            sInstance = new SystemConfig();
+        }
+        return sInstance;
+    }
+}
+SystemConfig() {
+    readAllPermissions();
+    readPublicNativeLibrariesList();
+}
+private void readAllPermissions() {
+    final XmlPullParser parser = Xml.newPullParser();
+    readPermissions(parser, Environment.buildPath(
+        Environment.getRootDirectory(), "etc", "sysconfig"), ALLOW_ALL);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getRootDirectory(), "etc", "permissions"), ALLOW_ALL);
+    
+    readPermissions(parser, Environment.buildPath(
+        Environment.getVendorDirectory(), "etc", "sysconfig"), vendorPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getVendorDirectory(), "etc", "permissions"), vendorPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getOdmDirectory(), "etc", "sysconfig"), odmPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getOdmDirectory(), "etc", "permissions"), odmPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getOemDirectory(), "etc", "sysconfig"), oemPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getOemDirectory(), "etc", "permissions"), oemPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getProductDirectory(), "etc", "sysconfig"), productPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getProductDirectory(), "etc", "permissions"), productPermissionFlag);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getSystemExtDirectory(), "etc", "sysconfig"), ALLOW_ALL);
+    readPermissions(parser, Environment.buildPath(
+        Environment.getSystemExtDirectory(), "etc", "permissions"), ALLOW_ALL);
+}
+private void readPublicNativeLibrariesList() {
+    readPublicLibrariesListFile(new File("/vendor/etc/public.libraries.txt"));
+    String[] dirs = {"/system/etc", "/system_ext/etc", "/product/etc"};
+    for (String dir : dirs) {
+        File[] files = new File(dir).listFiles();
+        if (files == null) {
+            continue;
+        }
+        for (File f : files) {
+            String name = f.getName();
+            if (name.startsWith("public.libraries-") && name.endsWith(".txt")){
+                readPublicLibrariesListFile(f);
+            }
+        }
+    }
+}
+```
 
+SystemConfig是全局的系统配置信息，通过解析相应的xml来配置。可以看到从以下目录获取permissions，（空，vendor，oem，odm，product，system）/etc/（permissions，sysconfig）这12个文件夹下的所有xml，另外还从（system，system_ext，product）/ect这3个目录读以public.libraries-开头，.txt结尾的NativeLibraries文件。
 
+看下readPermissions到底读了什么
+
+```java
+public void readPermissions(final XmlPullParser parser, File libraryDir, int permissionFlag) {
+    if (!libraryDir.exists() || !libraryDir.isDirectory()) {
+        return;
+    }
+    if (!libraryDir.canRead()) {
+        return;
+    }
+
+    File platformFile = null;
+    for (File f : libraryDir.listFiles()) {
+        if (!f.isFile()) {
+            continue;
+        }
+
+        // We'll read platform.xml last
+        // 先跳过读etc/permissions/platform.xml，存起来最后再读
+        if (f.getPath().endsWith("etc/permissions/platform.xml")) {
+            platformFile = f;
+            continue;
+        }
+		//只读xml文件
+        if (!f.getPath().endsWith(".xml")) {
+            continue;
+        }
+        if (!f.canRead()) {
+            continue;
+        }
+        readPermissionsFromXml(parser, f, permissionFlag);
+    }
+
+    if (platformFile != null) {
+        readPermissionsFromXml(parser, platformFile, permissionFlag);
+    }
+}
+private void readPermissionsFromXml(final XmlPullParser parser, File permFile,int permissionFlag) {
+    FileReader permReader = new FileReader(permFile);
+    parser.setInput(permReader);
+    //文件内容不是以permissions或者config节点开始的，直接抛异常
+    if (!parser.getName().equals("permissions") && !parser.getName().equals("config")) {
+        throw new XmlPullParserException("Unexpected start tag in ...");
+    }
+    
+    while (true) {
+        XmlUtils.nextElement(parser);
+        String name = parser.getName();
+        switch (name) {
+            case "group": {
+                String gidStr = parser.getAttributeValue(null, "gid");
+                int gid = android.os.Process.getGidForName(gidStr);
+                mGlobalGids = appendInt(mGlobalGids, gid);
+            }break;
+            case "permission": {
+                String perm = parser.getAttributeValue(null, "name");
+                readPermission(parser, perm);
+            }  break;
+            case "assign-permission": {
+                String perm = parser.getAttributeValue(null, "name");  
+                String uidStr = parser.getAttributeValue(null, "uid");
+                int uid = Process.getUidForName(uidStr);
+                ArraySet<String> perms = mSystemPermissions.get(uid);
+                if (perms == null) {
+                    perms = new ArraySet<String>();
+                    mSystemPermissions.put(uid, perms);
+                }
+                perms.add(perm);
+            }break;
+            case "feature": {
+                String fname = parser.getAttributeValue(null, "name");
+                int fversion = XmlUtils.readIntAttribute(parser, "version", 0);
+                addFeature(fname, fversion);
+            }break;
+            case "privapp-permissions": {
+				//单个app的权限，略
+            }break;
+                //...
+        }
+    }
+}
+private void addFeature(String name, int version) {
+    FeatureInfo fi = mAvailableFeatures.get(name);
+    if (fi == null) {
+        fi = new FeatureInfo();
+        fi.name = name;
+        fi.version = version;
+        mAvailableFeatures.put(name, fi);
+    } else {
+        fi.version = Math.max(fi.version, version);
+    }
+}
+```
+
+没什么好解释的，通过pull的方式解析xml，把相应的节点写入对应的变量中。
+
+PMS主要用到了AvailableFeatures和SharedLibraries，PMS的权限管理类PermissionManagerService用到了SystemPermissions和GlobalGids，其实就是上面扫描的xml里获取的group,permission,assign-permission,feature,library这些节点的值。
+
+```java
+//frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerServiceImpl.java
+PermissionManagerService(Context context,ArrayMap<String, FeatureInfo>availableFeatures) {
+	//...
+    mPermissionManagerServiceImpl = new PermissionManagerServiceImpl(context,availableFeatures);
+}
+public PermissionManagerServiceImpl(Context context,ArrayMap<String,FeatureInfo> availableFeatures) {
+ //...
+    SystemConfig systemConfig = SystemConfig.getInstance();
+    mSystemPermissions = systemConfig.getSystemPermissions();
+    mGlobalGids = systemConfig.getGlobalGids();
+}
+//PMS.java 构造函数
+SystemConfig systemConfig = injector.getSystemConfig();
+mAvailableFeatures = systemConfig.getAvailableFeatures();
+ArrayMap<String, SystemConfig.SharedLibraryEntry> libConfig
+    = systemConfig.getSharedLibraries();
+//Settings.java
+public int[] getGlobalGids() {
+    return mGlobalGids;
+}
+public SparseArray<ArraySet<String>> getSystemPermissions() {
+    return mSystemPermissions;
+}
+public ArrayMap<String, FeatureInfo> getAvailableFeatures() {
+    return mAvailableFeatures;
+}
+```
+
+我们来看下xml的数据结构
+
+> etc/permissions/platform.xml
+
+```xml
+<!-- This file is used to define the mappings between lower-level system
+     user and group IDs and the higher-level permission names managed
+     by the platform.
+-->
+<permissions>
+    <permission name="android.permission.READ_LOGS" >
+        <group gid="log" />
+    </permission>
+    //给uid为shell的分配Internet权限
+    <assign-permission name="android.permission.INTERNET" uid="shell" />
+    //...
+</permissions>
+```
+
+也可以给某个应用单独配置权限，以etc/permissions/`com.android.documentui`.xml为例
+
+```xml
+<permissions>
+    <privapp-permissions package="com.android.documentsui">
+        <permission name="android.permission.CHANGE_OVERLAY_PACKAGES"/>
+        <permission name="android.permission.INTERACT_ACROSS_USERS"/>
+        <!-- Permissions required for reading and logging compat changes -->
+        <permission name="android.permission.LOG_COMPAT_CHANGE"/>
+        <permission name="android.permission.MODIFY_QUIET_MODE"/>
+        <permission name="android.permission.READ_COMPAT_CHANGE_CONFIG"/>
+    </privapp-permissions>
+</permissions>
+```
+
+platform.xml最上面英文说明已经解释了此配置文件是为了在gid和uid做了映射关系。可以暂时理解成给某些uid或者某些应用（应用创建的时候也会指定相应的uid）分配指定的权限。
+
+##### Settings.readLPw
 
 
 
