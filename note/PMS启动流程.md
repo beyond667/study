@@ -422,27 +422,215 @@ public ArrayMap<String, FeatureInfo> getAvailableFeatures() {
 
 platform.xml最上面英文说明已经解释了此配置文件是为了在gid和uid做了映射关系。可以暂时理解成给某些uid或者某些应用（应用创建的时候也会指定相应的uid）分配指定的权限。
 
+#### 扫描启动流程
+
+继续看PMS构造函数后面的流程，上面只是准备了Settings和SystemConfig，后面才是关键的步骤。
+
+```java
+public PackageManagerService(PackageManagerServiceInjector injector,...){
+    //...
+    //1 读packages.xml文件，首次启动没这个文件，mFirstBoot为true
+    mFirstBoot = !mSettings.readLPw(computer, mInjector.getUserManagerInternal().getUsers(true,false,false));
+    //对于首次启动，通知jni层做了些初始化和拷贝动作
+    if (mFirstBoot) {
+        mInstaller.setFirstBoot();
+    }
+    if (!mOnlyCore && mFirstBoot) {
+        DexOptHelper.requestCopyPreoptedFiles();
+    }
+    //...
+    //2 扫描系统应用和非系统应用
+    PackageParser2 packageParser = mInjector.getScanningCachingPackageParser();
+    mOverlayConfig = mInitAppsHelper.initSystemApps(packageParser, packageSettings, userIds,startTime);
+    mInitAppsHelper.initNonSystemApps(packageParser, userIds, startTime);
+    //...
+    //3 写入packages.xml
+    writeSettingsLPrTEMP();
+}
+```
+
++ 注释1处调用mSettings.readLPw读packages.xml或者packages-backup.xml文件，如果是首次启动，由于没有这个文件，直接返回false，取反赋值给mFirstBoot，首次启动的话会通知jni层做一些拷贝动作，非首次启动packages.xml或者packages-backup.xml至少有一个存在，此文件记录的是关机前所有应用的信息和权限
++ 注释2会去扫描所有的系统和非系统应用
++ 注释3重新写入packages.xml
+
+这3个部分都看下。
+
 ##### Settings.readLPw
 
+> frameworks/base/services/core/java/com/android/server/pm/Settings.java
 
+```java
+boolean readLPw(@NonNull Computer computer, @NonNull List<UserInfo> users) {
+    FileInputStream str = null;
+    //备份文件如果存在，就用备份文件，并把packages.xml删除，因为有备份文件，说明上次写入packages.xml的时候有异常中断了写入
+    if (mBackupSettingsFilename.exists()) {
+        str = new FileInputStream(mBackupSettingsFilename);
+        if (mSettingsFilename.exists()) {
+            mSettingsFilename.delete();
+        }
+    }
 
+    //如果没有备份文件，先看是否有packages.xml，如果还没有，说明是首次启动，直接返回false
+    if (str == null) {
+        if (!mSettingsFilename.exists()) {
+            return false;
+        }
+        str = new FileInputStream(mSettingsFilename);
+    }
+    //到这里要么读的是packages.xml，要么是packages-backup.xml
+    final TypedXmlPullParser parser = Xml.resolvePullParser(str);
 
+    //后面就是解析xml的过程
+    while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+           && (type != XmlPullParser.END_TAG || parser.getDepth() > outerDepth)) {
+        String tagName = parser.getName();
+        if (tagName.equals("package")) {
+            readPackageLPw(parser, users, originalFirstInstallTimes);
+        } else if (tagName.equals("permissions")) {
+            mPermissions.readPermissions(parser);
+        } else if (tagName.equals("shared-user")) {
+            readSharedUserLPw(parser, users);
+        } 
+        //...
+    }
+}
+```
 
+上面注释很清楚了，不赘述，我们以`package`字段为例，调用到readPackageLPw
 
+```java
+private void readPackageLPw(TypedXmlPullParser parser, List<UserInfo> users,ArrayMap<String, Long> originalFirstInstallTimes){
+    //...
+    //读了packages.xml里package节点里面的属性
+    name = parser.getAttributeValue(null, ATTR_NAME);
+    realName = parser.getAttributeValue(null, "realName");
+    userId = parser.getAttributeInt(null, "userId", 0);
+    sharedUserAppId = parser.getAttributeInt(null, "sharedUserId", 0);
+    //...
+    packageSetting = addPackageLPw(name.intern(), realName, new File(codePathStr),
+                                   legacyNativeLibraryPathStr, primaryCpuAbiString, secondaryCpuAbiString,
+                                   cpuAbiOverrideString, userId, versionCode, pkgFlags, pkgPrivateFlags,
+                                   null , null ,null , null , null , domainSetId);
+    
+}
 
+final WatchedArrayMap<String, PackageSetting> mPackages;
+PackageSetting addPackageLPw(String name, String realName, File codePath...) {
+    PackageSetting p = mPackages.get(name);
+    if (p != null) {
+        if (p.getAppId() == uid) {
+            return p;
+        }
+        return null;
+    }
+    p = new PackageSetting(name, realName, codePath...);
+    p.setAppId(uid);
+    if (mAppIds.registerExistingAppId(uid, p, name)) {
+        mPackages.put(name, p);
+        return p;
+    }
+    return null;
+}
+```
 
+对于每一个app，都构建一个PackageSetting并缓存起来，另外还会像注册共享用户id一样注册所有其他应用的uid。
 
+##### 扫描系统和非系统应用
 
+继续看这两个方法：mInitAppsHelper.initSystemApps和initNonSystemApps
 
+>frameworks/base/services/core/java/com/android/server/pm/InitAppsHelper.java
 
+先看扫描系统应用
+```java
+private static final File DIR_ANDROID_ROOT = getDirectory(ENV_ANDROID_ROOT, "/system");
+public static @NonNull File getRootDirectory() {
+    return DIR_ANDROID_ROOT;
+}
 
+public OverlayConfig initSystemApps(PackageParser2 packageParser...) {
+    scanSystemDirs(packageParser, mExecutorService);
+    if (!mIsOnlyCoreApps) { 
+        mInstallPackageHelper.prepareSystemPackageCleanUp(packageSettings,mPossiblyDeletedUpdatedSystemApps, mExpectingBetter, userIds);
+    }
 
+}
+private void scanSystemDirs(PackageParser2 packageParser, ExecutorService executorService) {
+    File frameworkDir = new File(Environment.getRootDirectory(), "framework");
 
+    for (int i = mDirsToScanAsSystem.size() - 1; i >= 0; i--) {
+        final ScanPartition partition = mDirsToScanAsSystem.get(i);
+        if (partition.getOverlayFolder() == null) {
+            continue;
+        }
+        scanDirTracedLI(partition.getOverlayFolder()...);
+    }
 
+    scanDirTracedLI(frameworkDir, null,
+                    mSystemParseFlags,
+                    mSystemScanFlags | SCAN_NO_DEX | SCAN_AS_PRIVILEGED,
+                    packageParser, executorService);
 
+    for (int i = 0, size = mDirsToScanAsSystem.size(); i < size; i++) {
+        final ScanPartition partition = mDirsToScanAsSystem.get(i);
+        if (partition.getPrivAppFolder() != null) {
+            scanDirTracedLI(partition.getPrivAppFolder()...);
+        }
+        scanDirTracedLI(partition.getAppFolder()...);
+    }
+}
+```
 
+可以看到先扫描了mDirsToScanAsSystem列表所有的overlay子目录，再扫了`system/framework`目录，最后又扫了mDirsToScanAsSystem列表所有的`priv-app`和`app`目录，mDirsToScanAsSystem是在InitAppsHelper初始化时传进来的，最初又是由注射器带进来的，忽略具体调用流程，只看这配置的目录。
 
+> frameworks/base/core/java/com/android/server/pm/PackagePartitions.java
 
+```java
+public static final String PARTITION_NAME_SYSTEM = "system";
+public static final String PARTITION_NAME_ODM = "odm";
+public static final String PARTITION_NAME_OEM = "oem";
+public static final String PARTITION_NAME_PRODUCT = "product";
+public static final String PARTITION_NAME_SYSTEM_EXT = "system_ext";
+public static final String PARTITION_NAME_VENDOR = "vendor";
+private static final ArrayList<SystemPartition> SYSTEM_PARTITIONS =
+    new ArrayList<>(Arrays.asList(
+        new SystemPartition(Environment.getRootDirectory(),PARTITION_SYSTEM, Partition.PARTITION_NAME_SYSTEM,true , false),
+        new SystemPartition(Environment.getVendorDirectory(),PARTITION_VENDOR, Partition.PARTITION_NAME_VENDOR,true , true),
+        new SystemPartition(Environment.getOdmDirectory(),PARTITION_ODM, Partition.PARTITION_NAME_ODM,true, true ),
+        new SystemPartition(Environment.getOemDirectory(),PARTITION_OEM, Partition.PARTITION_NAME_OEM,false , true ),
+        new SystemPartition(Environment.getProductDirectory(),PARTITION_PRODUCT, Partition.PARTITION_NAME_PRODUCT,true , true ),
+        new SystemPartition(Environment.getSystemExtDirectory(),PARTITION_SYSTEM_EXT, Partition.PARTITION_NAME_SYSTEM_EXT, true, true )));
+```
+
+即会扫描system,vendor,oem,odm,product,system_ext下的overlay，priv-app，app目录
+
+再看扫描非系统应用
+
+```java
+public void initNonSystemApps(PackageParser2 packageParser...) {
+    if (!mIsOnlyCoreApps) {
+        scanDirTracedLI(mPm.getAppInstallDir(),null, 0,
+                        mScanFlags | SCAN_REQUIRE_KNOWN,packageParser, mExecutorService);
+    }
+    
+    mExpectingBetter.clear();
+}
+
+//PMS.java
+mAppInstallDir = new File(Environment.getDataDirectory(), "app");
+File getAppInstallDir() {
+    return mAppInstallDir;
+}
+
+//Environment.java
+private static final String DIR_ANDROID_DATA_PATH = getDirectoryPath(ENV_ANDROID_DATA, "/data");
+private static final File DIR_ANDROID_DATA = new File(DIR_ANDROID_DATA_PATH);
+public static File getDataDirectory() {
+    return DIR_ANDROID_DATA;
+}
+```
+
+非系统应用是扫描/data/app目录下所有的目录。不管是系统应用还是非系统应用，最终都调用了scanDirTracedLI去扫描相应目录。
 
 
 
