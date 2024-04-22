@@ -551,7 +551,8 @@ public static @NonNull File getRootDirectory() {
 public OverlayConfig initSystemApps(PackageParser2 packageParser...) {
     scanSystemDirs(packageParser, mExecutorService);
     if (!mIsOnlyCoreApps) { 
-        mInstallPackageHelper.prepareSystemPackageCleanUp(packageSettings,mPossiblyDeletedUpdatedSystemApps, mExpectingBetter, userIds);
+        //注意这里mPossiblyDeletedUpdatedSystemApps和mExpectingBetter
+        mInstallPackageHelper.prepareSystemPackageCleanUp(packageSettings, mPossiblyDeletedUpdatedSystemApps, mExpectingBetter, userIds);
     }
 
 }
@@ -612,7 +613,11 @@ public void initNonSystemApps(PackageParser2 packageParser...) {
         scanDirTracedLI(mPm.getAppInstallDir(),null, 0,
                         mScanFlags | SCAN_REQUIRE_KNOWN,packageParser, mExecutorService);
     }
-    
+    //...
+    //注意这里fixSystemPackages会去处理mExpectingBetter
+    if (!mIsOnlyCoreApps) {
+        fixSystemPackages(userIds);
+    }
     mExpectingBetter.clear();
 }
 
@@ -630,7 +635,117 @@ public static File getDataDirectory() {
 }
 ```
 
-非系统应用是扫描/data/app目录下所有的目录。不管是系统应用还是非系统应用，最终都调用了scanDirTracedLI去扫描相应目录。
+非系统应用是扫描/data/app目录下所有的目录。
+
+需要注意的是上面有两个列表关注:`possiblyDeletedUpdatedSystemApps`和`mExpectingBetter`
+
+了解这2个概念，我们需要了解OTA升级。**OTA升级其实就是标准系统升级方式，全称是Over-the-Air Technology。OTA升级无需备份数据，所有数据都会完好无损的保留下来，这个概念在ROM开发中比较常见。**
+
+对于一次OTA升级，会导致三种情况：
+
+* 系统应用无更新
+* 系统应用有新版本
+* 系统应用被删除
+
+扫描系统的时候调了mInstallPackageHelper.prepareSystemPackageCleanUp去设置possiblyDeletedUpdatedSystemApps和mExpectingBetter
+
+```java
+public void prepareSystemPackageCleanUp(
+    WatchedArrayMap<String, PackageSetting> packageSettings,
+    List<String> possiblyDeletedUpdatedSystemApps,
+    ArrayMap<String, File> expectingBetter, int[] userIds) {
+    // Iterates PackageSettings in reversed order because the item could be removed
+    // during the iteration.
+    for (int index = packageSettings.size() - 1; index >= 0; index--) {
+        final PackageSetting ps = packageSettings.valueAt(index);
+        final String packageName = ps.getPackageName();
+		//只处理系统应用
+        if (!ps.isSystem()) {
+            continue;
+        }
+
+        /*
+             * If the package is scanned, it's not erased.
+             */
+        final AndroidPackage scannedPkg = mPm.mPackages.get(packageName);
+        final PackageSetting disabledPs =
+            mPm.mSettings.getDisabledSystemPkgLPr(packageName);
+        if (scannedPkg != null) {
+            /*
+                 * If the system app is both scanned and in the
+                 * disabled packages list, then it must have been
+                 * added via OTA. Remove it from the currently
+                 * scanned package so the previously user-installed
+                 * application can be scanned.
+                 */
+            if (disabledPs != null) {
+                mRemovePackageHelper.removePackageLI(scannedPkg, true);
+                expectingBetter.put(ps.getPackageName(), ps.getPath());
+            }
+            continue;
+        }
+
+        if (disabledPs == null) {
+            mRemovePackageHelper.removePackageDataLIF(ps, userIds, null, 0, false);
+        } else {
+            //1 如果一个系统APP不复存在，且被标记为Disable状态，说明这个系统APP已经彻底不存在了，添加到possiblyDeletedUpdatedSystemApps删除列表
+            if (disabledPs.getPath() == null || !disabledPs.getPath().exists()
+                || disabledPs.getPkg() == null) {
+                possiblyDeletedUpdatedSystemApps.add(packageName);
+            } else {
+                // 否则添加到expectingBetter
+                expectingBetter.put(disabledPs.getPackageName(), disabledPs.getPath());
+            }
+        }
+    }
+}
+```
+
+扫描系统应用的时候会把要删除的系统应用放到possiblyDeletedUpdatedSystemApps，可能更新的放到expectingBetter缓存里。再看扫描非系统应用时调用fixSystemPackages，此时非系统应用已经扫描完毕
+
+```java
+private void fixSystemPackages(@NonNull int[] userIds) {
+    //根据mPossiblyDeletedUpdatedSystemApps去删除系统应用
+    mInstallPackageHelper.cleanupDisabledPackageSettings(mPossiblyDeletedUpdatedSystemApps, userIds, mScanFlags);
+    //处理mExpectingBetter数据
+    mInstallPackageHelper.checkExistingBetterPackages(mExpectingBetter,mStubSystemApps, mSystemScanFlags, mSystemParseFlags);
+    mInstallPackageHelper.installSystemStubPackages(mStubSystemApps, mScanFlags);
+}
+public void cleanupDisabledPackageSettings(List<String> possiblyDeletedUpdatedSystemApps,int[] userIds, int scanFlags) {
+    //遍历possiblyDeletedUpdatedSystemApps，通过mRemovePackageHelper.removePackageLI去移除要删除的系统应用
+    for (int i = possiblyDeletedUpdatedSystemApps.size() - 1; i >= 0; --i) {
+        final String packageName = possiblyDeletedUpdatedSystemApps.get(i);
+        final AndroidPackage pkg = mPm.mPackages.get(packageName);
+        mPm.mSettings.removeDisabledSystemPackageLPw(packageName);
+		//...
+        mRemovePackageHelper.removePackageLI(pkg, true);
+        final File codePath = new File(pkg.getPath());
+        scanSystemPackageTracedLI(codePath, 0, scanFlags, null);
+    }
+}
+public void checkExistingBetterPackages(ArrayMap<String, File> expectingBetterPackages,
+                                        List<String> stubSystemApps, int systemScanFlags, int systemParseFlags) {
+    //遍历expectingBetterPackages
+    for (int i = 0; i < expectingBetterPackages.size(); i++) {
+        final String packageName = expectingBetterPackages.keyAt(i);
+        if (mPm.mPackages.containsKey(packageName)) {
+            continue;
+        }
+        final File scanFile = expectingBetterPackages.valueAt(i);
+        //把系统应用enable
+        mPm.mSettings.enableSystemPackageLPw(packageName);
+        final AndroidPackage newPkg = scanSystemPackageTracedLI(
+            scanFile, reparseFlags, rescanFlags, null);
+        // We rescanned a stub, add it to the list of stubbed system packages
+        if (newPkg.isStub()) {
+            stubSystemApps.add(packageName);
+        }
+    }
+```
+
+其实就是扫系统前会把所有系统应用disable，再与ota升级的应用对比，如果新的已经不存在了，说明已经删除了，添加到待删除的应用列表，待扫描完非系统应用，再把要删除的系统应用删除，其他的应用重新enable。
+
+再继续看扫描过程，不管是系统应用还是非系统应用，最终都调用了scanDirTracedLI去扫描相应目录。
 
 
 
