@@ -716,11 +716,12 @@ public void cleanupDisabledPackageSettings(List<String> possiblyDeletedUpdatedSy
     for (int i = possiblyDeletedUpdatedSystemApps.size() - 1; i >= 0; --i) {
         final String packageName = possiblyDeletedUpdatedSystemApps.get(i);
         final AndroidPackage pkg = mPm.mPackages.get(packageName);
-        mPm.mSettings.removeDisabledSystemPackageLPw(packageName);
-		//...
-        mRemovePackageHelper.removePackageLI(pkg, true);
-        final File codePath = new File(pkg.getPath());
-        scanSystemPackageTracedLI(codePath, 0, scanFlags, null);
+     	//...
+        //settings里有，但是新的mPackages里没有，说明此系统应用已经删除，直接移除该应用
+        final PackageSetting ps = mPm.mSettings.getPackageLPr(packageName);
+        if (ps != null && mPm.mPackages.get(packageName) == null) {
+            mRemovePackageHelper.removePackageDataLIF(ps, userIds, null, 0, false);
+        }
     }
 }
 public void checkExistingBetterPackages(ArrayMap<String, File> expectingBetterPackages,
@@ -743,15 +744,91 @@ public void checkExistingBetterPackages(ArrayMap<String, File> expectingBetterPa
     }
 ```
 
-其实就是扫系统前会把所有系统应用disable，再与ota升级的应用对比，如果新的已经不存在了，说明已经删除了，添加到待删除的应用列表，待扫描完非系统应用，再把要删除的系统应用删除，其他的应用重新enable。
+其实就是扫系统前会把所有系统应用disable，再与ota升级的应用对比，如果新的已经不存在了，说明已经删除了，添加到待删除的应用列表，待扫描完非系统应用，再把要删除的系统应用删除，其他的系统应用重新enable，要更新的应用更新。
 
-再继续看扫描过程，不管是系统应用还是非系统应用，最终都调用了scanDirTracedLI去扫描相应目录。
+##### scanDirTracedLI
 
+再继续看扫描过程，不管是系统应用还是非系统应用，最终都调用了InitAppsHelper.scanDirTracedLI去扫描相应目录。
 
+```java
+private void scanDirTracedLI(File scanDir...PackageParser2 packageParser...) {
+    mInstallPackageHelper.installPackagesFromDir(scanDir...packageParser...);
+}
+```
 
+> frameworks/base/services/core/java/com/android/server/pm/InstallPackageHelper.java
 
+```java
+public void installPackagesFromDir(File scanDir...) {
+    final File[] files = scanDir.listFiles();
+    ParallelPackageParser parallelPackageParser =
+        new ParallelPackageParser(packageParser, executorService, frameworkSplits);
+    int fileCount = 0;
+    for (File file : files) {
+        //1 遍历传过来的scanDir的每个子文件夹，通过异步的方式去扫描每个应用的AndroidManifest.xml文件，并把解析结果包装到ParseResult中
+        parallelPackageParser.submit(file, parseFlags);
+        fileCount++;
+    }
+    for (; fileCount > 0; fileCount--) {
+        ParallelPackageParser.ParseResult parseResult = parallelPackageParser.take();
+        //2 对1处解析完的结果，再做相应的处理，比如构建PackageSetting
+        addForInitLI(parseResult.parsedPackage, parseFlags, scanFlags,null);
+    }
+}
+```
 
++ 注释1处是android6.0之后加入的ParallelPackageParser，采用**线程池+阻塞队列**的方式来扫描每个应用的AndroidManifest.xml文件，并把解析结果包装到ParseResult中，后面再通过take拿出结果，如果结果还没拿到，就会阻塞当前线程。
++ 注释2把解析完的结果再做相应的处理，比如构建PackageSetting对象，每个apk都对应一个PackageSetting对象，而Settings会保存这些pkg与PackageSetting的映射关系，而这些映射关系最后都会序列化到/data/system/packages.xml中
 
+我们详细看下注释1和注释2，先看parallelPackageParser.submit过程
+
+> frameworks/base/services/core/java/com/android/server/pm/ParallelPackageParser.java
+
+```java
+private final BlockingQueue<ParseResult> mQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+public void submit(File scanFile, int parseFlags) {
+    mExecutorService.submit(() -> {
+        ParseResult pr = new ParseResult();
+        pr.scanFile = scanFile;
+        pr.parsedPackage = parsePackage(scanFile, parseFlags);
+        mQueue.put(pr);
+    });
+}
+protected ParsedPackage parsePackage(File scanFile, int parseFlags) {
+    return mPackageParser.parsePackage(scanFile, parseFlags, true, mFrameworkSplits);
+}
+```
+
+通过线程池去执行parsePackage，执行结果放到mQueue中，而BlockingQueue为阻塞队列
+
+>frameworks/base/services/core/java/com/android/server/pm/parsing/PackageParser2.java
+
+```java
+public ParsedPackage parsePackage(File packageFile, int flags, boolean useCaches,List<File> frameworkSplits) {
+	//...
+    ParseResult<ParsingPackage> result = parsingUtils.parsePackage(input, packageFile, flags,frameworkSplits);
+    ParsedPackage parsed = (ParsedPackage) result.getResult().hideAsParsed();
+    return parsed;
+}
+```
+
+> frameworks/base/services/core/java/com/android/server/pm/pkg/parsing/ParsingPackageUtils.java
+
+```java
+public ParseResult<ParsingPackage> parsePackage(ParseInput input, File packageFile, int flags,List<File> frameworkSplits) {
+    if (((flags & PARSE_FRAMEWORK_RES_SPLITS) != 0)
+        && frameworkSplits.size() > 0
+        && packageFile.getAbsolutePath().endsWith("/framework-res.apk")) {
+        return parseClusterPackage(input, packageFile, frameworkSplits, flags);
+    } else if (packageFile.isDirectory()) {
+        return parseClusterPackage(input, packageFile, /* frameworkSplits= */null, flags);
+    } else {
+        return parseMonolithicPackage(input, packageFile, flags);
+    }
+}
+```
+
+如果是文件夹就走parseClusterPackage()，否则走parseMonolithicPackage()。这里Cluster和Monolithic是android5.1之后有的概念，主要是支持APK拆分，一个大的APK可以拆分成多个独立的APK，这些拆分的APK有相同的签名，解析过程就是把这些小的APK组合成一个Package，原来单独的apk叫Monolithic，拆分后的APK叫Cluster。
 
 
 
