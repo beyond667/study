@@ -780,7 +780,7 @@ public void installPackagesFromDir(File scanDir...) {
 + 注释1处是android6.0之后加入的ParallelPackageParser，采用**线程池+阻塞队列**的方式来扫描每个应用的AndroidManifest.xml文件，并把解析结果包装到ParseResult中，后面再通过take拿出结果，如果结果还没拿到，就会阻塞当前线程。
 + 注释2把解析完的结果再做相应的处理，比如构建PackageSetting对象，每个apk都对应一个PackageSetting对象，而Settings会保存这些pkg与PackageSetting的映射关系，而这些映射关系最后都会序列化到/data/system/packages.xml中
 
-我们详细看下注释1和注释2，先看parallelPackageParser.submit过程
+我们详细看下注释1和注释2，先看注释1的parallelPackageParser.submit的完整解析过程
 
 > frameworks/base/services/core/java/com/android/server/pm/ParallelPackageParser.java
 
@@ -807,11 +807,12 @@ protected ParsedPackage parsePackage(File scanFile, int parseFlags) {
 public ParsedPackage parsePackage(File packageFile, int flags, boolean useCaches,List<File> frameworkSplits) {
 	//...
     ParseResult<ParsingPackage> result = parsingUtils.parsePackage(input, packageFile, flags,frameworkSplits);
+    //特别注意：这里做了转换
     ParsedPackage parsed = (ParsedPackage) result.getResult().hideAsParsed();
     return parsed;
 }
 ```
-
+需要特别注意的是result包的是ParsingPackage，这里对扫描后的结果ParsingPackage强转成ParsedPackage，能强转说明扫描的时候生成的实现类也实现了ParsedPackage 
 > frameworks/base/services/core/java/com/android/server/pm/pkg/parsing/ParsingPackageUtils.java
 
 ```java
@@ -828,11 +829,332 @@ public ParseResult<ParsingPackage> parsePackage(ParseInput input, File packageFi
 }
 ```
 
-如果是文件夹就走parseClusterPackage()，否则走parseMonolithicPackage()。这里Cluster和Monolithic是android5.1之后有的概念，主要是支持APK拆分，一个大的APK可以拆分成多个独立的APK，这些拆分的APK有相同的签名，解析过程就是把这些小的APK组合成一个Package，原来单独的apk叫Monolithic，拆分后的APK叫Cluster。
+如果是文件夹就走parseClusterPackage()，否则走parseMonolithicPackage()。这里Cluster和Monolithic是android5.1之后有的概念，主要是支持APK拆分，一个大的APK可以拆分成多个独立的APK，这些拆分的APK有相同的签名，解析过程就是把这些小的APK组合成一个Package，原来单独的apk叫Monolithic，拆分后的APK叫Cluster。对于Cluster的解析，也是遍历其文件夹，如果子文件夹还是文件夹，继续遍历，直到把所有apk都找到并解析。两者最后都是通过parseApkLite去解析AndroidManifest文件的拆分包信息和parseBaseApk去解析四大组件等完整基本信息。我们只看parseMonolithicPackage即可
 
+```java
+private ParseResult<ParsingPackage> parseMonolithicPackage(ParseInput input, File apkFile,int flags) {
+    //1 去解析分包信息
+    final ParseResult<PackageLite> liteResult =
+        ApkLiteParseUtils.parseMonolithicPackageLite(input, apkFile, flags);
+    final PackageLite lite = liteResult.getResult();
+    final SplitAssetLoader assetLoader = new DefaultSplitAssetLoader(lite, flags);
+    //2 parseBaseApk解析四大组件等
+    final ParseResult<ParsingPackage> result = parseBaseApk(input, apkFile,apkFile.getCanonicalPath(),assetLoader, flags);
+    return input.success(result.getResult().setUse32BitAbi(lite.isUse32bitAbi()));
+}
+public static ParseResult<PackageLite> parseMonolithicPackageLite(ParseInput input,File packageFile, int flags) {
+    final ParseResult<ApkLite> result = parseApkLite(input, packageFile, flags);
+    final ApkLite baseApk = result.getResult();
+    final String packagePath = packageFile.getAbsolutePath();
+    return input.success(
+        new PackageLite(packagePath, baseApk.getPath(), baseApk...));
+}
+public static ParseResult<ApkLite> parseApkLite(ParseInput input, FileDescriptor fd, String debugPathName, int flags) {
+    return parseApkLiteInner(input, null, fd, debugPathName, flags);
+}
+private static ParseResult<ApkLite> parseApkLiteInner(ParseInput input,
+                                                      File apkFile, FileDescriptor fd, String debugPathName, int flags) {
+    XmlResourceParser parser = null;
+    //打开AndroidManifest.xml
+    parser = apkAssets.openXml(ANDROID_MANIFEST_FILENAME);
+    return parseApkLite(input, apkPath, parser, signingDetails, flags);
+}
+private static ParseResult<ApkLite> parseApkLite(ParseInput input, String codePath,
+                                                 XmlResourceParser parser, SigningDetails signingDetails, int flags){
+    //...
+    //这里解析了些分包信息
+    while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+           && (type != XmlPullParser.END_TAG || parser.getDepth() >= searchDepth)) {
+        if (TAG_PACKAGE_VERIFIER.equals(parser.getName())) {...}
+        else if (TAG_APPLICATION.equals(parser.getName())) {...}
 
+    }
+    return input.success(
+        new ApkLite(codePath, packageSplit.first, packageSplit.second, isFeatureSplit,
+                    configForSplit, usesSplitName, isSplitRequired, versionCode,
+                    versionCodeMajor, revisionCode, installLocation, verifiers, signingDetails,
+                    coreApp, debuggable, profilableByShell, multiArch, use32bitAbi,
+                    useEmbeddedDex, extractNativeLibs, isolatedSplits, targetPackage,
+                    overlayIsStatic, overlayPriority, requiredSystemPropertyName,
+                    requiredSystemPropertyValue, minSdkVersion, targetSdkVersion,
+                    rollbackDataPolicy, requiredSplitTypes.first, requiredSplitTypes.second,
+                    hasDeviceAdminReceiver, isSdkLibrary));
+}
+```
 
++ 注释1最终通过parseApkLite去解析AndroidManifest.xml的拆分包信息，new的ApkLite对象封装后返回
++ 注释2会解析完整的应用信息，我们继续看
 
+```java
+private ParseResult<ParsingPackage> parseBaseApk(ParseInput input, File apkFile,
+                                                 String codePath, SplitAssetLoader assetLoader, int flags) {
+    try (XmlResourceParser parser = assets.openXmlResourceParser(cookie,ANDROID_MANIFEST_FILENAME)) {
+        ParseResult<ParsingPackage> result = parseBaseApk(input, apkPath, codePath, res,parser, flags);
+        final ParsingPackage pkg = result.getResult();
+        //设置uuid和签名等
+        pkg.setVolumeUuid(volumeUuid);
+        pkg.setSigningDetails(ret.getResult());
+        return input.success(pkg);
+    }
+}
+private ParseResult<ParsingPackage> parseBaseApk(ParseInput input, String apkPath,
+                                                 String codePath, Resources res, XmlResourceParser parser, int flags){
+    //...
+    final ParsingPackage pkg = mCallback.startParsingPackage(
+        pkgName, apkPath, codePath, manifestArray, isCoreApp);
+    final ParseResult<ParsingPackage> result =
+        parseBaseApkTags(input, pkg, manifestArray, res, parser, flags);
+    return input.success(pkg);
+}
+//PackageParser2.java的内部类Callback：start
+public static abstract class Callback implements ParsingPackageUtils.Callback {
+
+    @Override
+    public final ParsingPackage startParsingPackage(@NonNull String packageName,
+                                                    @NonNull String baseCodePath, @NonNull String codePath,
+                                                    @NonNull TypedArray manifestArray, boolean isCoreApp) {
+        return PackageImpl.forParsing(packageName, baseCodePath, codePath, manifestArray,
+                                      isCoreApp);
+    }
+}
+//PackageParser2.java的内部类Callback：end
+//PackageImpl.java:start
+//PackageImpl实现了ParsedPackage，继承的ParsingPackageImpl也实现了ParsingPackage
+//所以PackageImpl既可以强转成ParsedPackage,也可以强转为ParsingPackage
+public class PackageImpl extends ParsingPackageImpl implements ParsedPackage{
+    public static PackageImpl forParsing(String packageName, String baseCodePath,String codePath...) {
+        return new PackageImpl(packageName, baseCodePath, codePath, manifestArray, isCoreApp);
+    }
+}
+//PackageImpl.java:end
+
+private ParseResult<ParsingPackage> parseBaseApkTags(ParseInput input, ParsingPackage pkg,
+                                                     TypedArray sa, Resources res, XmlResourceParser parser, int flags){
+    while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+           && (type != XmlPullParser.END_TAG
+               || parser.getDepth() > depth)) {
+        if (TAG_APPLICATION.equals(tagName)) {
+            result = parseBaseApplication(input, pkg, res, parser, flags);
+        }
+    }
+    //...
+}
+private ParseResult<ParsingPackage> parseBaseApplication(ParseInput input, ParsingPackage pkg, Resources res, XmlResourceParser parser, int flags){
+    //解析了application里所有基本信息，比如debugable，enable,allowBackup，icon，logo，theme
+    parseBaseAppBasicFlags(pkg, sa);
+    while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+           && (type != XmlPullParser.END_TAG
+               || parser.getDepth() > depth)) {
+        switch (tagName) {
+            case "activity": isActivity = true;
+            case "receiver":
+                ParseResult<ParsedActivity> activityResult =
+                    ParsedActivityUtils.parseActivityOrReceiver(mSeparateProcesses, pkg,res, parser, flags, sUseRoundIcon, null /*defaultSplitName*/,input);
+                break;
+            case "service":
+                ParseResult<ParsedService> serviceResult =
+                    ParsedServiceUtils.parseService(mSeparateProcesses, pkg, res, parser,
+                                                    flags, sUseRoundIcon, null /*defaultSplitName*/,
+                                                    input);
+                break;
+                //provider类似
+        }
+        return input.success(pkg);
+    }
+```
+
+可以看到真正完整解析AndroidManifest是在parseBaseApplication里，处理解析icon，logo外，专门解析了四大组件，并把解析的结果返回。
+
+注意的是，返回的pkg是ParsingPackage，是在解析前通过startParsingPackage这里new出来的PackageImpl，而PackageImpl除了继承ParsingPackageImpl（实现了ParsingPackage和Parcelable），又是实现了ParsedPackage接口（名字起的太有误导性了，不过PackageImpl确实比较特殊，既要作为解析包的实现类，又要作为Parcelable来存解析后的数据，后面又要转换成ParsedPackage去映射PackageSetting）
+
+##### addForInitLI
+
+上面注释1的完整解析过程后，继续看注释2的addForInitLI根据解析的结果ParsedPackage来构建PackageSetting
+
+> frameworks/base/services/core/java/com/android/server/pm/InstallPackageHelper.java
+
+```java
+private AndroidPackage addForInitLI(ParsedPackage parsedPackage,int parseFlags,int scanFlags,UserHandle user)  {
+    final Pair<ScanResult, Boolean> scanResultPair = scanSystemPackageLI(parsedPackage, parseFlags, scanFlags, user);
+    //...
+    //1 这里会把扫描PackageSetting真正添加到Settings里
+    commitReconciledScanResultLocked(reconcileResult.get(pkgName), mPm.mUserManager.getUserIds());
+}
+private Pair<ScanResult, Boolean> scanSystemPackageLI(ParsedPackage parsedPackage...){
+    //...省略校验过程
+    final ScanResult scanResult = scanPackageNewLI(parsedPackage, parseFlags,scanFlags | SCAN_UPDATE_SIGNATURE, 0, user, null);
+    return new Pair<>(scanResult, shouldHideSystemApp);
+}
+private ScanResult scanPackageNewLI(ParsedPackage parsedPackage...){
+    synchronized (mPm.mLock) {
+        assertPackageIsValid(parsedPackage, parseFlags, newScanFlags);
+        final ScanRequest request = new ScanRequest(parsedPackage...);
+        return ScanPackageUtils.scanPackageOnlyLI(request, mPm.mInjector, mPm.mFactoryTest, currentTime);
+    }
+}
+```
+
+> frameworks/base/services/core/java/com/android/server/pm/ScanPackageUtils.java
+
+```java
+public static ScanResult scanPackageOnlyLI(ScanRequest request,PackageManagerServiceInjector injector...){
+    PackageSetting pkgSetting = request.mPkgSetting;
+    if (pkgSetting != null && oldSharedUserSetting != sharedUserSetting) {
+        pkgSetting = null;
+    }
+    final boolean createNewPackage = (pkgSetting == null);
+   //根据sharedUserid判断是否要创建新的PackageSetting，不需要创建的话就更新
+    if (createNewPackage) {
+        pkgSetting = Settings.createNewSetting(parsedPackage.getPackageName()...);
+    }else{
+        pkgSetting = new PackageSetting(pkgSetting);
+        pkgSetting.setPkg(parsedPackage);
+        Settings.updatePackageSetting(pkgSetting...);
+    }
+    //... 再对pkgSetting进行一些设置
+    pkgSetting.setLastModifiedTime(scanFileTime);
+    pkgSetting.setPkg(parsedPackage)
+        .setPkgFlags(PackageInfoUtils.appInfoFlags(...));
+    return new ScanResult(request, true, pkgSetting, changedAbiCodePath,
+                          !createNewPackage ,
+                          Process.INVALID_UID  , sdkLibraryInfo,
+                          staticSharedLibraryInfo, dynamicSharedLibraryInfos);
+}
+```
+
+这里会根据sharedUserSetting去判断是否需要创建PackageSetting，需要的话就通过Settings.createNewSetting去创建，否则就直接根据已有的PackageSetting去重新构建新的PackageSetting，再通过Settings.updatePackageSetting去更新，两者其实都是构建或者更新PackageSetting对象，但是此时还未绑定到Settings里，虽然这里调用了Settings的方法，但实际上还未添加到Settings的缓存对象**mPackages**里。
+
+继续看注释1的commitReconciledScanResultLocked真正添加到Settings里
+
+```java
+public AndroidPackage commitReconciledScanResultLocked(ReconciledPackage reconciledPkg, int[] allUsers) {
+    //...
+    //把扫描的结果转化成AndroidPackage
+    final AndroidPackage pkg = parsedPackage.hideAsFinal();
+    commitPackageSettings(pkg, oldPkg, pkgSetting, oldPkgSetting, scanFlags,
+                          (parseFlags & ParsingPackageUtils.PARSE_CHATTY) != 0, reconciledPkg);
+    return pkg;
+}
+private void commitPackageSettings(AndroidPackage pkg...) {
+    //...
+    synchronized (mPm.mLock) {
+        // We don't expect installation to fail beyond this point
+        // Add the new setting to mSettings
+        mPm.mSettings.insertPackageSettingLPw(pkgSetting, pkg);
+        mPm.mPackages.put(pkg.getPackageName(), pkg);
+    }
+    //...
+}
+```
+
+除了往settings里添加，pms里也缓存了此扫描结果。
+
+```java
+void insertPackageSettingLPw(PackageSetting p, AndroidPackage pkg) {
+    //如果签名为空就更新签名，如果shareduserSetting不同也更新
+    // Update signatures if needed.
+    if (p.getSigningDetails().getSignatures() == null) {
+        p.setSigningDetails(pkg.getSigningDetails());
+    }
+    // If this app defines a shared user id initialize
+    // the shared user signatures as well.
+    SharedUserSetting sharedUserSetting = getSharedUserSettingLPr(p);
+    if (sharedUserSetting != null) {
+        if (sharedUserSetting.signatures.mSigningDetails.getSignatures() == null) {
+            sharedUserSetting.signatures.mSigningDetails = pkg.getSigningDetails();
+        }
+    }
+    addPackageSettingLPw(p, sharedUserSetting);
+}
+void addPackageSettingLPw(PackageSetting p, SharedUserSetting sharedUser) {
+    //添加到mPackages缓存的arraymap中
+    mPackages.put(p.getPackageName(), p);
+    //略，更新shareduser
+}
+```
+
+到这里就添加到settings的mPackages缓存里了。以上就是整个扫描解析AndroidManifest.xml并最终将PackageSetting缓存在Setting。下面就是把有可能的更新数据通过Settings.writeLPr写入packages.xml的过程了。
+
+#### writeLPr
+
+```java
+//PMS构造函数调用
+ writeSettingsLPrTEMP();
+
+void writeSettingsLPrTEMP() {
+    mPermissionManager.writeLegacyPermissionsTEMP(mSettings.mPermissions);
+    mSettings.writeLPr(mLiveComputer);
+}
+```
+
+直接调用Settings.writeLPr
+
+```java
+void writeLPr(@NonNull Computer computer) {
+    //1 如果/data/system/packages.xml文件存在
+    if (mSettingsFilename.exists()) {
+        if (!mBackupSettingsFilename.exists()) {
+            if (!mSettingsFilename.renameTo(mBackupSettingsFilename)) {
+                return;
+            }
+        } else {
+            mSettingsFilename.delete();
+        }
+    }
+    try {
+        final FileOutputStream fstr = new FileOutputStream(mSettingsFilename);
+        final TypedXmlSerializer serializer = Xml.resolveSerializer(fstr);
+        serializer.startDocument(null, true);
+        serializer.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true);
+        serializer.startTag(null, "packages");
+
+		//2 遍历已经缓存的mPackages，通过writePackageLPr写入packages.xml
+        for (final PackageSetting pkg : mPackages.values()) {
+            writePackageLPr(serializer, pkg);
+        }
+
+        for (final PackageSetting pkg : mDisabledSysPackages.values()) {
+            writeDisabledSysPackageLPr(serializer, pkg);
+        }
+        //...
+        serializer.endTag(null, "packages");
+        serializer.endDocument();
+        fstr.flush();
+        FileUtils.sync(fstr);
+        fstr.close();
+
+        //3 写入成功，删除备份文件
+        mBackupSettingsFilename.delete();
+        return;
+
+    } catch(java.io.IOException e) {}
+    //4 写入过程有异常，就删了packages.xml文件，保留备份文件
+    if (mSettingsFilename.exists()) {
+        if (!mSettingsFilename.delete()) {
+        }
+    }
+}
+void writePackageLPr(TypedXmlSerializer serializer, final PackageSetting pkg){
+    serializer.startTag(null, "package");
+    serializer.attribute(null, ATTR_NAME, pkg.getPackageName());
+    serializer.attributeLong(null, "version", pkg.getVersionCode());
+    if (!pkg.hasSharedUser()) {
+        serializer.attributeInt(null, "userId", pkg.getAppId());
+    } else {
+        serializer.attributeInt(null, "sharedUserId", pkg.getAppId());
+    }
+    //...
+    serializer.endTag(null, "package");
+}
+```
+
+写入过程较简单。
+
++ 注释1 先判断packages.xml是否存在，如果不存在，说明是首次启动或者上次写入packages.xml时有异常把此文件删除了，就直接写入packages.xml；如果存在，再去检查备份文件是否存在，如果有备份文件，说明上次更新packages.xml有异常，并且packages.xml没删除成功，直接删掉package.xml再写入此文件，如果备份文件不存在，就把packages.xml重命名为packages-backup.xml，再写入packages.xml
++ 注释2遍历已经缓存的mPackages，通过writePackageLPr写入packages.xml，可以看到writePackageLPr写入的详细字段信息
++ 注释3和4 如果写入成功，直接删除备份文件，否则删除packages.xml文件
+
+初看这块感觉逻辑不太对，假如有异常，packages.xml都删除了，此时还保留备份文件，再重启时判断packages.xml是否存在时，假如不存在，备份文件完全没有用到就直接写入packages.xml，难道备份文件存在的作用只是在packages.xml也存在时才有用？（比如正在写入package.xml时断电或者删除packages.xml不成功等异常，导致此时存在packages.xml和备份文件都存在），这种场景下也只是删除了packages.xml，没看出备份文件存在的必要性，或者随便写入个某个文件记录下即可。要回答这问题要看前面readLPw的过程，读的时候先看是否有备份文件，有的话就用备份并把packages.xml删除，没有的话再看是否有packages.xml文件，如果有就用，没有就认为是首次启动，也就是说读的时候会用到备份文件，否则无法还原更改packages.xml前的场景。
 
 
 
