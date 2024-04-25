@@ -1156,13 +1156,141 @@ void writePackageLPr(TypedXmlSerializer serializer, final PackageSetting pkg){
 
 初看这块感觉逻辑不太对，假如有异常，packages.xml都删除了，此时还保留备份文件，再重启时判断packages.xml是否存在时，假如不存在，备份文件完全没有用到就直接写入packages.xml，难道备份文件存在的作用只是在packages.xml也存在时才有用？（比如正在写入package.xml时断电或者删除packages.xml不成功等异常，导致此时存在packages.xml和备份文件都存在），这种场景下也只是删除了packages.xml，没看出备份文件存在的必要性，或者随便写入个某个文件记录下即可。要回答这问题要看前面readLPw的过程，读的时候先看是否有备份文件，有的话就用备份并把packages.xml删除，没有的话再看是否有packages.xml文件，如果有就用，没有就认为是首次启动，也就是说读的时候会用到备份文件，否则无法还原更改packages.xml前的场景。
 
+写入完成后PMS启动流程的大部分都已经完成了，后面SystemServer.startOtherServices会执行PMS.systemReady方法，这里会执行关联服务的systemReady，至此PMS启动流程就结束了。
 
+#### PMS查询流程
 
+使用场景比如在launcher显示应用列表，或者点击某个icon去启动某个应用，或者就是查询某个包的信息。
 
+```java
+//app查询本机所有应用信息
+PackageManager pm = mContext.getPackageManager();
+Intent intent = new Intent();
+intent.setAction(Intent.ACTION_MAIN);
+intent.addCategory(Intent.CATEGORY_LAUNCHER);
+List<ResolveInfo> list =  pm.queryIntentActivities(intent, PackageManager.MATCH_ALL);
 
+//获取某个apk的启动intent
+Intent launchIntent = packageManager.getLaunchIntentForPackage("com.android.launcher3");
+mContext.startActivity(launchIntent);
+//查询某个apk的包信息
+PackageInfo packageInfo = packageManager.getPackageInfo("com.android.launcher3", 0);
+```
 
+先看getPackageManager返回的PackageManager
 
+> frameworks/base/core/java/android/app/ContextImpl.java
 
+```java
+private PackageManager mPackageManager;    
+public PackageManager getPackageManager() {
+    if (mPackageManager != null) {
+        return mPackageManager;
+    }
+    //这里拿到PMS的代理类IPackageManager
+    final IPackageManager pm = ActivityThread.getPackageManager();
+    if (pm != null) {
+        //把代理类IPackageManager封装到ApplicationPackageManager返回
+        return (mPackageManager = new ApplicationPackageManager(this, pm));
+    }
+    return null;
+}
+```
+
+客户端拿到的PackageManager其实是封装了IPackageManager的本地类ApplicationPackageManager，所以客户端调用queryIntentActivities，getLaunchIntentForPackage，getPackageInfo是调用的ApplicationPackageManager的方法
+
+> frameworks/base/core/java/android/app/ApplicationPackageManager.java
+
+```java
+public List<ResolveInfo> queryIntentActivities(Intent intent, int flags) {
+    return queryIntentActivities(intent, ResolveInfoFlags.of(flags));
+}
+public List<ResolveInfo> queryIntentActivities(Intent intent, ResolveInfoFlags flags) {
+    return queryIntentActivitiesAsUser(intent, flags, getUserId());
+}
+public List<ResolveInfo> queryIntentActivitiesAsUser(Intent intent, int flags, int userId) {
+    return queryIntentActivitiesAsUser(intent, ResolveInfoFlags.of(flags), userId);
+}
+public List<ResolveInfo> queryIntentActivitiesAsUser(Intent intent, ResolveInfoFlags flags, int userId) {
+    ParceledListSlice<ResolveInfo> parceledList = mPM.queryIntentActivities(intent...);
+    if (parceledList == null) {
+        return Collections.emptyList();
+    }
+    return parceledList.getList();
+}
+```
+
+套娃式的调用到PMS.queryIntentActivities，PMS的内部binder类IPackageManagerImpl没实现此方法，是在父类IPackageManagerBase实现的
+
+>frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java
+
+```java
+ParceledListSlice<ResolveInfo> queryIntentActivities(Intent intent...) {
+    return new ParceledListSlice<>(snapshot().queryIntentActivitiesInternal(intent,resolvedType, flags, userId));
+}
+protected Computer snapshot() {
+    return mService.snapshotComputer();
+}
+```
+
+调用到ComputerEngine.queryIntentActivitiesInternal
+
+> frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java
+
+```java
+public final List<ResolveInfo> queryIntentActivitiesInternal(Intent intent...) {
+    return queryIntentActivitiesInternal(...);
+}
+public final List<ResolveInfo> queryIntentActivitiesInternal(Intent intent,...) {
+    ComponentName comp = intent.getComponent();
+    List<ResolveInfo> list = Collections.emptyList();
+   	//对于查的是某一个应用，只查询一个即可，所以ArrayList直接申请大小为1就行
+    if (comp != null) {
+        final ActivityInfo ai = getActivityInfo(comp, flags, userId);
+        //...
+        final ResolveInfo ri = new ResolveInfo();
+        ri.activityInfo = ai;
+        list = new ArrayList<>(1);
+        list.add(ri);
+    }else{
+        //对于查的是所有应用，调用queryIntentActivitiesInternalBody把结果封装到QueryIntentActivitiesResult
+        QueryIntentActivitiesResult lockedResult = queryIntentActivitiesInternalBody(...);
+        if (lockedResult.answer != null) {
+            skipPostResolution = true;
+            list = lockedResult.answer;
+        } 
+    }
+    //如果skipPostResolution为true，直接返回list
+     return skipPostResolution ? list : applyPostResolutionFilter(list...);
+}
+```
+
+这里根据传进来的ComponentName是否为空来判断是要查一个应用还是所有应用。对于所有应用走queryIntentActivitiesInternalBody，对于一个应用走getActivityInfo，我们分别来看下，先看getActivityInfo。
+
+```java
+public final ActivityInfo getActivityInfo(ComponentName component...) {
+    return getActivityInfoInternal(component, flags, Binder.getCallingUid(), userId);
+}
+public final ActivityInfo getActivityInfoInternal(ComponentName component,long flags, int filterCallingUid, int userId) {
+    //省略校验userid和权限
+    return getActivityInfoInternalBody(component, flags, filterCallingUid, userId);
+}
+protected ActivityInfo getActivityInfoInternalBody(ComponentName component,long flags, int filterCallingUid, int userId) {
+    ParsedActivity a = mComponentResolver.getActivity(component);
+    //假设设备已经安装了此应用，这时候a不为空，就从mPackages来拿应用的信息AndroidPackage
+    AndroidPackage pkg = a == null ? null : mPackages.get(a.getPackageName());
+    if (pkg != null && mSettings.isEnabledAndMatch(pkg, a, flags, userId)) {
+        PackageStateInternal ps = mSettings.getPackage(component.getPackageName());
+        if (ps == null) return null;
+        return PackageInfoUtils.generateActivityInfo(pkg,a, flags, ps.getUserStateOrDefault(userId), userId, ps);
+    }
+    
+    if (resolveComponentName().equals(component)) {
+        return PackageInfoWithoutStateUtils.generateDelegateActivityInfo(mResolveActivity...);
+    }
+    return null;
+}
+```
 
 
 
