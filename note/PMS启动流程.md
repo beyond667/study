@@ -1042,12 +1042,16 @@ private void commitPackageSettings(AndroidPackage pkg...) {
         // Add the new setting to mSettings
         mPm.mSettings.insertPackageSettingLPw(pkgSetting, pkg);
         mPm.mPackages.put(pkg.getPackageName(), pkg);
+        
+        //存进pms的mComponentResolver里
+        final Computer snapshot = mPm.snapshotComputer();
+        mPm.mComponentResolver.addAllComponents(pkg, chatty, mPm.mSetupWizardPackage, snapshot);
     }
     //...
 }
 ```
 
-除了往settings里添加，pms里也缓存了此扫描结果。
+除了往settings里添加，pms里也缓存了此扫描结果，还在pms的mComponentResolver缓存了信息，这个在后面模糊匹配查找应用会用到此Resolver
 
 ```java
 void insertPackageSettingLPw(PackageSetting p, AndroidPackage pkg) {
@@ -1154,7 +1158,7 @@ void writePackageLPr(TypedXmlSerializer serializer, final PackageSetting pkg){
 + 注释2遍历已经缓存的mPackages，通过writePackageLPr写入packages.xml，可以看到writePackageLPr写入的详细字段信息
 + 注释3和4 如果写入成功，直接删除备份文件，否则删除packages.xml文件
 
-初看这块感觉逻辑不太对，假如有异常，packages.xml都删除了，此时还保留备份文件，再重启时判断packages.xml是否存在时，假如不存在，备份文件完全没有用到就直接写入packages.xml，难道备份文件存在的作用只是在packages.xml也存在时才有用？（比如正在写入package.xml时断电或者删除packages.xml不成功等异常，导致此时存在packages.xml和备份文件都存在），这种场景下也只是删除了packages.xml，没看出备份文件存在的必要性，或者随便写入个某个文件记录下即可。要回答这问题要看前面readLPw的过程，读的时候先看是否有备份文件，有的话就用备份并把packages.xml删除，没有的话再看是否有packages.xml文件，如果有就用，没有就认为是首次启动，也就是说读的时候会用到备份文件，否则无法还原更改packages.xml前的场景。
+初看这块感觉逻辑不太对，假如有异常，packages.xml都删除了，此时还保留备份文件，再重启时判断packages.xml是否存在时，假如不存在，备份文件完全没有用到就直接写入packages.xml，难道备份文件存在的作用只是在packages.xml也存在时才有用？（比如正在写入package.xml时断电或者删除packages.xml不成功等异常，导致此时存在packages.xml和备份文件都存在），这种场景下也只是删除了packages.xml，没看出备份文件存在的必要性，或者随便写入某个文件记录下即可。要回答这问题要看前面readLPw的过程，读的时候先看是否有备份文件，有的话就用备份并把packages.xml删除，没有的话再看是否有packages.xml文件，如果有就用，没有就认为是首次启动，也就是说读的时候会用到备份文件，否则无法还原更改packages.xml前的场景。
 
 写入完成后PMS启动流程的大部分都已经完成了，后面SystemServer.startOtherServices会执行PMS.systemReady方法，这里会执行关联服务的systemReady，至此PMS启动流程就结束了。
 
@@ -1277,11 +1281,12 @@ public final ActivityInfo getActivityInfoInternal(ComponentName component,long f
 }
 protected ActivityInfo getActivityInfoInternalBody(ComponentName component,long flags, int filterCallingUid, int userId) {
     ParsedActivity a = mComponentResolver.getActivity(component);
-    //假设设备已经安装了此应用，这时候a不为空，就从mPackages来拿应用的信息AndroidPackage
+    //1 假设设备已经安装了此应用，这时候a不为空，就从mPackages来拿应用的信息AndroidPackage
     AndroidPackage pkg = a == null ? null : mPackages.get(a.getPackageName());
     if (pkg != null && mSettings.isEnabledAndMatch(pkg, a, flags, userId)) {
         PackageStateInternal ps = mSettings.getPackage(component.getPackageName());
         if (ps == null) return null;
+        //2 根据查到的pkg去构建activityInfo返回
         return PackageInfoUtils.generateActivityInfo(pkg,a, flags, ps.getUserStateOrDefault(userId), userId, ps);
     }
     
@@ -1292,33 +1297,84 @@ protected ActivityInfo getActivityInfoInternalBody(ComponentName component,long 
 }
 ```
 
++ 注释1从ComputerEngine缓存的mPackages里查找AndroidPackage
++ 注释2如果查到就构建ActivityInfo返回，构建过程可以理解成AndroidPackage的值赋值给ActivityInfo，不再赘述
 
+注意的是ComputerEngine里面的mPackages本质也是PMS里的mPackages，我们看下其赋值过程
 
+```java
+//PMS.java
+final WatchedArrayMap<String, AndroidPackage> mPackages = new WatchedArrayMap<>();
+private final SnapshotCache<WatchedArrayMap<String, AndroidPackage>> mPackagesSnapshot = new SnapshotCache.Auto(mPackages, mPackages, "PackageManagerService.mPackages");
 
+//PMS.java构造函数最后
+public PackageManagerService(){
+    //...
+    mLiveComputer = createLiveComputer();
+}
+private ComputerLocked createLiveComputer() {
+    return new ComputerLocked(new Snapshot(Snapshot.LIVE));
+}
 
+//PMS的内部类Snapshot
+class Snapshot {
+    public final WatchedArrayMap<String, AndroidPackage> packages;
+    Snapshot(int type) {
+        //...
+        //内部类Snapshot持有了PMS的Packages的快照
+        packages = mPackagesSnapshot.snapshot();
+    }
+}
+//以上都是PMS.java
 
+//ComputerLocked.java
+public final class ComputerLocked extends ComputerEngine {
+    ComputerLocked(PackageManagerService.Snapshot args) {
+        super(args, -1);
+    }
+}
+//ComputerLocked的父类ComputerEngine
+private final WatchedArrayMap<String, AndroidPackage> mPackages;
+ComputerEngine(PackageManagerService.Snapshot args, int version) {
+    mSettings = new Settings(args.settings);
+    mPackages = args.packages;
+    //...
+}
+```
 
+可以看到ComputerEngine内部持有的是最新的settings和AndroidPackage
 
+再看查询多个情况queryIntentActivitiesInternalBody
 
+```java
+public  QueryIntentActivitiesResult queryIntentActivitiesInternalBody( Intent intent...) {
+    //...
+    List<ResolveInfo> result = null;
+    if (pkgName == null) {
+        //1 从本地缓存的mComponentResolver查询ResolveInfo列表
+        result = filterIfNotSystemUser(mComponentResolver.queryActivities(this,intent, resolvedType, flags, userId), userId);
+        //对查找的过滤
+    }else{
+        //先从settings里查找这个pkg，再通过reslover查找这个应用详情
+        final PackageStateInternal setting =
+            getPackageStateInternal(pkgName, Process.SYSTEM_UID);
+        result = filterIfNotSystemUser(mComponentResolver.queryActivities( setting.getAndroidPackage().getActivities()...), userId);
 
+    }
+    return new QueryIntentActivitiesResult(sortResult, addInstant, result);
+}
 
+public PackageStateInternal getPackageStateInternal(String packageName,int callingUid) {
+    return mSettings.getPackage(packageName);
+}
+```
 
++ 注释1对于查找所有应用信息，先从ComputerEngine的本地缓存mComponentResolver去查找ResolveInfo列表，此数据在上面commitPackageSettings时已经赋值。再进行一些过滤，比如有些应用设置的system_user_only，这些数据不会返回。
++ 注释2对于查找某个应用的信息，先从本地settings里查找，再通过mComponentResolver去查找此应用的详细信息。
 
+总结下：PMS查询操作是通过ComputerEngine来完成的，而ComputerEngine是在pms启动时缓存了PMS的mPackages，settings和mComponentResolver的这些信息。
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-#### adb install流程
+#### adb install安装流程
 
 常见的安装场景有以下几种：
 
