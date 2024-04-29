@@ -975,9 +975,13 @@ private ParseResult<ParsingPackage> parseBaseApplication(ParseInput input, Parsi
 
 ```java
 private AndroidPackage addForInitLI(ParsedPackage parsedPackage,int parseFlags,int scanFlags,UserHandle user)  {
+    //1 scan阶段
     final Pair<ScanResult, Boolean> scanResultPair = scanSystemPackageLI(parsedPackage, parseFlags, scanFlags, user);
     //...
-    //1 这里会把扫描PackageSetting真正添加到Settings里
+    //2 reconcile阶段
+    final Map<String, ReconciledPackage> reconcileResult =
+        ReconcilePackageUtils.reconcilePackages(reconcileRequest,mSharedLibraries, mPm.mSettings.getKeySetManagerService(),mPm.mSettings);
+    //3 commit阶段 这里会把扫描PackageSetting真正添加到Settings里
     commitReconciledScanResultLocked(reconcileResult.get(pkgName), mPm.mUserManager.getUserIds());
 }
 private Pair<ScanResult, Boolean> scanSystemPackageLI(ParsedPackage parsedPackage...){
@@ -993,6 +997,11 @@ private ScanResult scanPackageNewLI(ParsedPackage parsedPackage...){
     }
 }
 ```
++ 注释1是安装过程的扫描阶段
++ 注释2是安装过程的reconcile阶段，reconcile是调和，协调的意思
++ 注释3是安装过程的commit阶段，这里会把扫描PackageSetting真正添加到Settings里
+
+先看注释1扫描阶段
 
 > frameworks/base/services/core/java/com/android/server/pm/ScanPackageUtils.java
 
@@ -1024,7 +1033,46 @@ public static ScanResult scanPackageOnlyLI(ScanRequest request,PackageManagerSer
 
 这里会根据sharedUserSetting去判断是否需要创建PackageSetting，需要的话就通过Settings.createNewSetting去创建，否则就直接根据已有的PackageSetting去重新构建新的PackageSetting，再通过Settings.updatePackageSetting去更新，两者其实都是构建或者更新PackageSetting对象，但是此时还未绑定到Settings里，虽然这里调用了Settings的方法，但实际上还未添加到Settings的缓存对象**mPackages**里。
 
-继续看注释1的commitReconciledScanResultLocked真正添加到Settings里
+再看注释2的reconcile阶段
+
+> frameworks/base/services/core/java/com/android/server/pm/ReconcilePackageUtils.java
+
+```java
+public static Map<String, ReconciledPackage> reconcilePackages(ReconcileRequest request...){
+    final Map<String, ScanResult> scannedPackages = request.mScannedPackages;
+    final Map<String, ReconciledPackage> result = new ArrayMap<>(scannedPackages.size());
+    final ArrayMap<String, AndroidPackage> combinedPackages =
+        new ArrayMap<>(request.mAllPackages.size() + scannedPackages.size());
+    combinedPackages.putAll(request.mAllPackages);
+    
+    for (String installPackageName : scannedPackages.keySet()) {
+        final ScanResult scanResult = scannedPackages.get(installPackageName);
+        // add / replace existing with incoming packages
+        combinedPackages.put(scanResult.mPkgSetting.getPackageName(), scanResult.mRequest.mParsedPackage);
+
+        //...
+        //如果是更新，构建个删除包的action
+        final DeletePackageAction deletePackageAction;
+        if (isInstall && prepareResult.mReplace && !prepareResult.mSystem) {
+            deletePackageAction = DeletePackageHelper.mayDeletePackageLocked(res.mRemovedInfo,);
+            if (deletePackageAction == null) {
+                throw new ReconcileFailure("May not delete ");
+            }
+        } else {
+            deletePackageAction = null;
+        }
+        //...省略检查包的其他信息，比如验证签名,数据库版本
+        
+        result.put(installPackageName,new ReconciledPackage(request...deletePackageAction...));
+    }
+    
+    return result;
+}
+```
+
+reconcile阶段主要是在commit之前再验证下要安装的包的信息，以保证安装能成功，另外如果是更新应用，会构建个删除包的action塞到result中，commit时会去执行删除旧包操作（这里由于是开机启动所以没有删除包的操作，替换安装时调用commitPackagesLocked会删除旧包）
+
+继续看注释3的commitReconciledScanResultLocked真正添加到Settings里
 
 ```java
 public AndroidPackage commitReconciledScanResultLocked(ReconciledPackage reconciledPkg, int[] allUsers) {
@@ -1604,8 +1652,117 @@ private int doRunInstall(final InstallParams params) throws RemoteException{
     }
     //...
 }
+
+private int doCommitSession(int sessionId, boolean logSuccess) {
+    session = new PackageInstaller.Session(
+        mInterface.getPackageInstaller().openSession(sessionId));
+    session.commit(receiver.getIntentSender());
+    //...
+}
 ```
 
-这里通过doCreateSession和doCommitSession跟PackageInstall交互，通过PackageInstall去真正走安装流程。这个我们在PMS安装流程里具体看。
+这里通过doCommitSession调用到PackageInstallerSession.commit，后面就是通过PackageInstall去真正走安装流程。
+
+调用流程如下：PackageInstallerSession.commit -> dispatchSessionSealed ->Handler(MSG_ON_SESSION_SEALED) -> handleSessionSealed ->dispatchStreamValidateAndCommit ->Handler(MSG_STREAM_VALIDATE_AND_COMMIT) ->handleStreamValidateAndCommit->Handler(MSG_INSTALL) -> handleInstall ->verify->verifyNonStaged -> onVerificationComplete->install->installNonStaged->InstallParams.installStage->PackageHandler(INIT_COPY)->HandlerParams.startCopy->InstallParams.handleReturnCode->processPendingInstall->processInstallRequestsAsync->InstallPackageHelper.processInstallRequests->installPackagesTracedLI->installPackagesLI
+
+我们重点关注安装包的帮助类InstallPackageHelper.installPackagesLI
+
+```java
+   private void installPackagesLI(List<InstallRequest> requests) {
+       //...
+       //1 第一阶段 Prepare
+       prepareResult =preparePackageLI(request.mArgs, request.mInstallResult);
+
+       //2 第二阶段 Scan 调用到scanPackageNewLI，上面已经看过了
+       final ScanResult result = scanPackageTracedLI(
+           prepareResult.mPackageToScan, prepareResult.mParseFlags,
+           prepareResult.mScanFlags, System.currentTimeMillis(),
+           request.mArgs.mUser, request.mArgs.mAbiOverride);
+       
+       //3 第三阶段 Reconcile
+       ReconcileRequest reconcileRequest = new ReconcileRequest(preparedScans, installArgs,installResults, prepareResults, Collections.unmodifiableMap(mPm.mPackages), versionInfos);
+       reconciledPackages = ReconcilePackageUtils.reconcilePackages(reconcileRequest, mSharedLibraries,mPm.mSettings.getKeySetManagerService(), mPm.mSettings);
+       
+       //4 第四阶段 Commit
+       commitRequest = new CommitRequest(reconciledPackages,mPm.mUserManager.getUserIds());
+       commitPackagesLocked(commitRequest);
+
+       executePostCommitSteps(commitRequest);
+   }
+```
+
+安装过程分为以上四个阶段
+
++ prepare阶段
++ Scan阶段 
++ Reconcile阶段
++ commit阶段
+
+后面3个步骤在前面已经介绍过了，只看第一个prepare不同的地方
+
+> frameworks/base/services/core/java/com/android/server/pm/InstallPackageHelper.java
+
+```java
+private PrepareResult preparePackageLI(InstallArgs args, PackageInstalledInfo res){
+     final File tmpPackageFile = new File(args.getCodePath());
+    //...
+    final ParsedPackage parsedPackage;
+    try (PackageParser2 pp = mPm.mInjector.getPreparingPackageParser()) {
+        //1 parsePackage解析指定的apk文件
+        parsedPackage = pp.parsePackage(tmpPackageFile, parseFlags, false);
+        AndroidPackageUtils.validatePackageDexMetadata(parsedPackage);
+    } catch (PackageManagerException e) {} 
+    //省略设置签名信息，校验版本信息等
+    
+    //2 根据解析后的pkgName去判断是否此次安装是更新
+    String pkgName = res.mName = parsedPackage.getPackageName();
+    boolean replace = false;
+    synchronized (mPm.mLock) {
+        String oldName = mPm.mSettings.getRenamedPackageLPr(pkgName);
+        if (parsedPackage.getOriginalPackages().contains(oldName)
+            && mPm.mPackages.containsKey(oldName)) {
+            parsedPackage.setPackageName(oldName);
+            pkgName = parsedPackage.getPackageName();
+            replace = true;
+        }else if (mPm.mPackages.containsKey(pkgName)) {
+            replace = true;
+        }
+    }
+    //如果是更新应用 先检查下如果新版本小于等于22 旧版本大于22抛异常；如果旧版本是persistent持久的，不允许更新抛异常
+    if (replace) {
+        AndroidPackage oldPackage = mPm.mPackages.get(pkgName);
+        final int oldTargetSdk = oldPackage.getTargetSdkVersion();
+        final int newTargetSdk = parsedPackage.getTargetSdkVersion();
+        if (oldTargetSdk > Build.VERSION_CODES.LOLLIPOP_MR1
+            && newTargetSdk <= Build.VERSION_CODES.LOLLIPOP_MR1) { 
+         throw new PrepareFailure("new target SDK...");}
+        if (oldPackage.isPersistent()&& ((installFlags & PackageManager.INSTALL_STAGED) == 0)) {
+            throw new PrepareFailure( " is a persistent app. ");
+        }
+    }
+    //省略校验签名，shareduser信息等
+    
+    //遍历AndroidManifest里所有声明的权限，校验有没有声明不允许声明的
+    final int n = ArrayUtils.size(parsedPackage.getPermissions());
+    for (int i = n - 1; i >= 0; i--) {
+        final ParsedPermission perm = parsedPackage.getPermissions().get(i);
+		//省略校验权限
+    }
+    
+    //如果是系统应用，不能安装到sd卡和设置instant属性
+    if (systemApp) {
+        if (onExternal) {
+            throw new PrepareFailure("Cannot install updates to system apps on sdcard");
+        } else if (instantApp) {
+            throw new PrepareFailure("Cannot update a system app with an instant app");
+        }
+    }
+    //...
+    
+    return new PrepareResult(replace, targetScanFlags, targetParseFlags, oldPackage, parsedPackage, replace /* clearCodeCache */, sysPkg, ps, disabledPs);
+}
+```
+
+准备阶段先通过parsePackage去解析指定apk的AndroidManifest文件，上面已经详细看过parsePackage方法了。然后跟PMS缓存的mPackages比较，如果相等说明是更新，对更新的应用做一些版本和属性的校验。再校验签名shareduser等，还会遍历声明的权限，看是否有不允许声明的权限。准备阶段本质上就是解析Manifest文件，然后去各种校验，校验失败的话直接抛异常，这里可以看下安装失败都会有哪些原因。
 
 总的来说，adb install命令会先在adb进程构建服务端执行的shell语句后通过socket传给shell进程执行，shell进程执行cmd package 指令后获取指定的服务，比如PMS，并通过binder机制调用其shellCommand，最终再根据传的adb后面的参数，比如install/uninstall执行相应的安装/卸载。
