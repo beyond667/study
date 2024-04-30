@@ -963,13 +963,13 @@ private ParseResult<ParsingPackage> parseBaseApplication(ParseInput input, Parsi
     }
 ```
 
-可以看到真正完整解析AndroidManifest是在parseBaseApplication里，处理解析icon，logo外，专门解析了四大组件，并把解析的结果返回。
+可以看到真正完整解析AndroidManifest是在parseBaseApplication里，除了解析icon，logo外，专门解析了四大组件，并把解析的结果返回。
 
 注意的是，返回的pkg是ParsingPackage，是在解析前通过startParsingPackage这里new出来的PackageImpl，而PackageImpl除了继承ParsingPackageImpl（实现了ParsingPackage和Parcelable），又是实现了ParsedPackage接口（名字起的太有误导性了，不过PackageImpl确实比较特殊，既要作为解析包的实现类，又要作为Parcelable来存解析后的数据，后面又要转换成ParsedPackage去映射PackageSetting）
 
 ##### addForInitLI
 
-上面注释1的完整解析过程后，继续看注释2的addForInitLI根据解析的结果ParsedPackage来构建PackageSetting
+上面注释1的完整解析过程后（安装过程的第一个阶段--准备阶段），继续看注释2的addForInitLI根据解析的结果ParsedPackage来构建PackageSetting
 
 > frameworks/base/services/core/java/com/android/server/pm/InstallPackageHelper.java
 
@@ -978,23 +978,14 @@ private AndroidPackage addForInitLI(ParsedPackage parsedPackage,int parseFlags,i
     //1 scan阶段
     final Pair<ScanResult, Boolean> scanResultPair = scanSystemPackageLI(parsedPackage, parseFlags, scanFlags, user);
     //...
+    //根据1扫描的结果构建ReconcileRequest
+    final ScanResult scanResult = scanResultPair.first;
+    final ReconcileRequest reconcileRequest = new ReconcileRequest(Collections.singletonMap(pkgName, scanResult)...);
     //2 reconcile阶段
     final Map<String, ReconciledPackage> reconcileResult =
         ReconcilePackageUtils.reconcilePackages(reconcileRequest,mSharedLibraries, mPm.mSettings.getKeySetManagerService(),mPm.mSettings);
     //3 commit阶段 这里会把扫描PackageSetting真正添加到Settings里
     commitReconciledScanResultLocked(reconcileResult.get(pkgName), mPm.mUserManager.getUserIds());
-}
-private Pair<ScanResult, Boolean> scanSystemPackageLI(ParsedPackage parsedPackage...){
-    //...省略校验过程
-    final ScanResult scanResult = scanPackageNewLI(parsedPackage, parseFlags,scanFlags | SCAN_UPDATE_SIGNATURE, 0, user, null);
-    return new Pair<>(scanResult, shouldHideSystemApp);
-}
-private ScanResult scanPackageNewLI(ParsedPackage parsedPackage...){
-    synchronized (mPm.mLock) {
-        assertPackageIsValid(parsedPackage, parseFlags, newScanFlags);
-        final ScanRequest request = new ScanRequest(parsedPackage...);
-        return ScanPackageUtils.scanPackageOnlyLI(request, mPm.mInjector, mPm.mFactoryTest, currentTime);
-    }
 }
 ```
 + 注释1是安装过程的扫描阶段
@@ -1006,6 +997,19 @@ private ScanResult scanPackageNewLI(ParsedPackage parsedPackage...){
 > frameworks/base/services/core/java/com/android/server/pm/ScanPackageUtils.java
 
 ```java
+private Pair<ScanResult, Boolean> scanSystemPackageLI(ParsedPackage parsedPackage...){
+    //...省略校验过程
+    final ScanResult scanResult = scanPackageNewLI(parsedPackage, parseFlags,scanFlags | SCAN_UPDATE_SIGNATURE, 0, user, null);
+    return new Pair<>(scanResult, shouldHideSystemApp);
+}
+private ScanResult scanPackageNewLI(ParsedPackage parsedPackage...){
+    //...
+    synchronized (mPm.mLock) {
+        assertPackageIsValid(parsedPackage, parseFlags, newScanFlags);
+        final ScanRequest request = new ScanRequest(parsedPackage...);
+        return ScanPackageUtils.scanPackageOnlyLI(request, mPm.mInjector, mPm.mFactoryTest, currentTime);
+    }
+}
 public static ScanResult scanPackageOnlyLI(ScanRequest request,PackageManagerServiceInjector injector...){
     PackageSetting pkgSetting = request.mPkgSetting;
     if (pkgSetting != null && oldSharedUserSetting != sharedUserSetting) {
@@ -1031,7 +1035,7 @@ public static ScanResult scanPackageOnlyLI(ScanRequest request,PackageManagerSer
 }
 ```
 
-这里会根据sharedUserSetting去判断是否需要创建PackageSetting，需要的话就通过Settings.createNewSetting去创建，否则就直接根据已有的PackageSetting去重新构建新的PackageSetting，再通过Settings.updatePackageSetting去更新，两者其实都是构建或者更新PackageSetting对象，但是此时还未绑定到Settings里，虽然这里调用了Settings的方法，但实际上还未添加到Settings的缓存对象**mPackages**里。
+扫描阶段主要是构建PackageSetting。这里会根据sharedUserSetting去判断是否需要创建PackageSetting，需要的话就通过Settings.createNewSetting去创建，否则就直接根据已有的PackageSetting去重新构建新的PackageSetting，再通过Settings.updatePackageSetting去更新，两者其实都是构建或者更新PackageSetting对象，但是此时还未绑定到Settings里，虽然这里调用了Settings的方法，但实际上还未添加到Settings的缓存对象**mPackages**里。
 
 再看注释2的reconcile阶段
 
@@ -1051,7 +1055,7 @@ public static Map<String, ReconciledPackage> reconcilePackages(ReconcileRequest 
         combinedPackages.put(scanResult.mPkgSetting.getPackageName(), scanResult.mRequest.mParsedPackage);
 
         //...
-        //如果是更新，构建个删除包的action
+        //如果是更新，构建个删除旧包的action
         final DeletePackageAction deletePackageAction;
         if (isInstall && prepareResult.mReplace && !prepareResult.mSystem) {
             deletePackageAction = DeletePackageHelper.mayDeletePackageLocked(res.mRemovedInfo,);
@@ -1070,7 +1074,7 @@ public static Map<String, ReconciledPackage> reconcilePackages(ReconcileRequest 
 }
 ```
 
-reconcile阶段主要是在commit之前再验证下要安装的包的信息，以保证安装能成功，另外如果是更新应用，会构建个删除包的action塞到result中，commit时会去执行删除旧包操作（这里由于是开机启动所以没有删除包的操作，替换安装时调用commitPackagesLocked会删除旧包）
+reconcile阶段主要是在commit之前再验证下要安装的包的信息，以保证安装能成功，另外如果是更新应用，会构建个删除包的action塞到result中，commit时会去执行删除旧包操作（这里由于是开机启动所以没有删除包的操作，正常安装更新时调用commitPackagesLocked会删除旧包）
 
 继续看注释3的commitReconciledScanResultLocked真正添加到Settings里
 
