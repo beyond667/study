@@ -5,7 +5,7 @@
 [Activity启动流程](https://github.com/beyond667/study/blob/master/note/Activity%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md)
 [深入理解Service启动流程](https://github.com/beyond667/study/blob/master/note/Service%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md)
 [深入理解BroadcastReceiver](https://github.com/beyond667/study/blob/master/note/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3BroadcastReceiver%E5%B9%BF%E6%92%AD%E6%B3%A8%E5%86%8C%E5%92%8C%E5%8F%91%E9%80%81%E6%B5%81%E7%A8%8B.md)
-[深入理解ContentProvider](https://github.com/beyond667/study/blob/master/note/AMS%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md)
+[深入理解ContentProvider](https://github.com/beyond667/study/blob/master/note/ContentProvider%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md)
 
 Framework <img width=600/>|
 ---|
