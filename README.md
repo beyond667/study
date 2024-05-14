@@ -9,7 +9,6 @@
 
 Framework <img width=600/>|
 ---|
-[深入理解AMS](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
 [PMS启动流程](https://github.com/beyond667/study/blob/master/note/PMS%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md) 
 [深入理解WMS](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
 [installd守护进程](https://github.com/beyond667/study/blob/master/note/installd%E5%AE%88%E6%8A%A4%E8%BF%9B%E7%A8%8B.md) 
@@ -36,6 +35,6 @@ Android  <img width=600/>|
 ---|
 [LeakCanary实现原理](https://github.com/beyond667/study/blob/master/note/LeakCanary%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86.md)
 
-Native  <img width=600/>|
----|
-[JNI相关](https://github.com/beyond667/study/blob/master/note/JNI%E7%9B%B8%E5%85%B3.md)
+|Native  <img width=600/>|
+|---|
+|[JNI相关](https://github.com/beyond667/study/blob/master/note/JNI%E7%9B%B8%E5%85%B3.md)|
