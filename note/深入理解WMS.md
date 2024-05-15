@@ -19,5 +19,57 @@ WMS（WindowManagerService）是继AMS,PMS之后一个非常复杂又非常重�
 
 Android系统中的窗口是屏幕上一块用户绘制各种UI元素并响应用户输入的一块矩形区域，从原理上来讲，窗口是独自占有一块Surface实例的显示区域，例如，activity，dialog，壁纸，状态栏，toast等都是窗口。（Surface可以理解成一块画布，应用可以通过Canvas或OpenGL在上作画，再通过SurfaceFlinger将多块Surface按特定是顺序（z-order）合并后输出到FrameBuffer，再通过屏幕驱动显示到屏幕）
 
-窗口是个抽象类，实现类是PhoneWindow，是所有View的直接管理者，客户端把xml布局翻译成view后嵌到以contentview为id的DecorView中，PhoneWindow管理此DecorView，所以事件传递也是由window-> DecorView>具体的view。
+窗口是个抽象类，实现类是PhoneWindow，是所有View的直接管理者，客户端把xml布局翻译成view后嵌到以content为id的DecorView中，PhoneWindow管理此DecorView，所以事件传递也是由window-> DecorView>具体的view。
+
+```java
+//Activity.java
+final void attach(){
+    //...
+    mWindow = new PhoneWindow(this, window, activityConfigCallback); 
+    mWindow.setWindowManager(...);
+    //...
+}
+//Window.java
+public abstract class Window {
+    public void setWindowManager(WindowManager wm, IBinder appToken, String appName) {
+        setWindowManager(wm, appToken, appName, false);
+    }
+    public void setWindowManager(WindowManager wm, IBinder appToken, String appName,boolean hardwareAccelerated) {
+        if (wm == null) {
+            wm = (WindowManager)mContext.getSystemService(Context.WINDOW_SERVICE);
+        }
+        mWindowManager = ((WindowManagerImpl)wm).createLocalWindowManager(this);
+    }
+}
+//WindowManagerImpl.java
+public WindowManagerImpl createLocalWindowManager(Window parentWindow) {
+    return new WindowManagerImpl(mContext, parentWindow, mWindowContextToken);
+}
+//调用activity.setContentView时
+//PhoneWindow.java
+public void setContentView(int layoutResID) {
+    installDecor();
+    //...
+}
+ private void installDecor() {
+     //...
+     //生成DecorView
+      mDecor = generateDecor(-1);
+     //根据decorview生成具体的容器
+      mContentParent = generateLayout(mDecor);
+     //...
+ }
+protected ViewGroup generateLayout(DecorView decor) {
+    //...
+    //com.android.internal.R.id.content，即以content为key的viewgrop
+    ViewGroup contentParent = (ViewGroup)findViewById(ID_ANDROID_CONTENT);
+    //...
+}
+```
+
+PhoneWindow的创建是在Activity的attach里，并调用其setWindowManager去创建WindowManagerImpl，此WindowManagerImpl持有个全局的单例WindowManagerGlobal，WindowManagerGlobal里持有WMS的代理对象，调用其addview时会创建ViewRootImpl，并通过wms.openSession创建跟应用的Session，一个应用只有一个session。
+
+这里对应关系如下：
+
+Activity <一对一> PhoneWindow <一对一>WindowManagerImpl<多对一> WindowManagerGlobal<一对多>ViewRootImpl<多对一>Session
 
