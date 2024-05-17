@@ -207,7 +207,7 @@ class Session extends IWindowSession.Stub implements IBinder.DeathRecipient {
 
 ##### WindowToken
 
-一个WindowToken就代表一个应用组件，应用组件包括Activity，InputMethod等。比如一个应该启动了两个Activity，这两个Activity在WMS里就有两个WindowToken，这样在WMS对窗口进行ZOrder排序时，会将同一个应用的WindowToken排在一起。另外，WindowToken还有令牌的作用，在WMS.addWindow时会根据应用传过来的windowToken来鉴权，传进来的WindowToken必须与该应用的窗口类型必须保持一致，比如一个普通应用addWindow时传过来的WindowToken是系统类型的窗口，或者直接不传WindowToken都会报错。如果是系统类型的窗口，可以不用提供WindowToken，WMS会为该系统创建，但是需要此应用有创建该类型窗口的权限。
+一个WindowToken就代表一个应用组件，应用组件包括Activity，InputMethod等。比如一个应该启动了两个Activity，这两个Activity在WMS里就有两个WindowToken，这样在WMS对窗口进行ZOrder排序时，会将同一个WindowToken包的WindowState排在一起。另外，WindowToken还有令牌的作用，在WMS.addWindow时会根据应用传过来的windowToken来鉴权，传进来的WindowToken必须与该应用的窗口类型必须保持一致，比如一个普通应用addWindow时传过来的WindowToken是系统类型的窗口，或者直接不传WindowToken都会报错。如果是系统类型的窗口，可以不用提供WindowToken，WMS会为该系统创建，但是需要此应用有创建该类型窗口的权限。
 
 ```java
 //WMS.java
@@ -217,7 +217,7 @@ public int addWindow(Session session, IWindow client, LayoutParams attrs...){
     WindowToken token = displayContent.getWindowToken(hasParent ? parentWindow.mAttrs.token : attrs.token);
     final int rootType = hasParent ? parentWindow.mAttrs.type : type;
     if (token == null) {
-        //如果token没传，通过unprivilegedAppCanCreateTokenWith去判断是不是系统指定的窗口
+        //如果从displayContent拿不到WindowToken，通过unprivilegedAppCanCreateTokenWith去判断是不是系统指定的窗口
         if (!unprivilegedAppCanCreateTokenWith(parentWindow, callingUid, type,rootType, attrs.token, attrs.packageName)) {
             return WindowManagerGlobal.ADD_BAD_APP_TOKEN;
         }
@@ -227,6 +227,7 @@ public int addWindow(Session session, IWindow client, LayoutParams attrs...){
         } else if (mWindowContextListenerController.hasListener(windowContextToken)) {
              //...
         } else {
+            //2 为系统窗口创建windowToken时如果LayoutParams里有token就用LayoutParams里的，没有的话就用Iwindow这个binder的
             final IBinder binder = attrs.token != null ? attrs.token : client.asBinder();
             token = new WindowToken.Builder(this, binder, type)
                 .setDisplayContent(displayContent)
@@ -246,10 +247,10 @@ public int addWindow(Session session, IWindow client, LayoutParams attrs...){
         //...
     } 
     
-    //2 创建WindowState时把token传过去，记录到其mToken变量
+    //3 创建WindowState时把windowToken传过去，记录到其mToken变量
     final WindowState win = new WindowState(this, session, client, token...);
     //...
-    //3 WindowToken作为容器添加此WindowState
+    //4 WindowToken作为容器添加此WindowState
     win.mToken.addWindow(win);
     //...
 }
@@ -273,10 +274,13 @@ private boolean unprivilegedAppCanCreateTokenWith(int rootType...) {
 WMS.addWindow是view绘制很重要的一个方法，这里暂只关注跟WindowToken相关。
 
 + 注释1处通过displayContent去获取windowToken，如果没传，需判断是否是系统窗口，如果是的话就创建个WindowToken，如果不是就直接报错
-+ 注释2创建WindowState，我们后面重点讲这个。这里把WindowToken传进去，记录到其mToken变量里
-+ 注释3把WindowToken作为容器添加了WindowState
++ 注释2在为系统窗口创建windowToken容器时，如果LayoutParams里有token（binder）就用，没有的话就用IWindow的binder
++ 注释3创建WindowState，我们后面重点讲这个。这里把WindowToken传进去，记录到其mToken变量里
++ 注释4把WindowToken作为容器添加了WindowState
 
-那我们再看看WindowToken.java
+根据注释4可猜测，WindowToken其实本质就是个装WindowState的容器，WindowToken里面持有的token其实就是binder对象。再根据注释1推测displayContent里有以binder为key，WindowToken为value的缓存
+
+那我们基于以上猜测来看看WindowToken和DisplayContent
 
 ```java
 //WindowToken.java
@@ -304,13 +308,66 @@ void addWindowToken(IBinder binder, WindowToken token) {
     //...
     mTokenMap.put(binder, token);
 }
+WindowToken getWindowToken(IBinder binder) {
+    return mTokenMap.get(binder);
+}
 ```
 
-从WindowToken类的定义看，其本质是个装WindowToken的容器，内部持有了wms和token，从其构造函数可知，token本质就是个binder对象，并通过DisplayContent.addWindowToken在DisplayContent中记录了token和WindowToken的对应关系。这里传进来的binder本质上是客户端ViewRootImpl.setView时通过Session.addToDisplayAsUser传过来的IWindow.Stub对象
+从WindowToken类的定义看，其本质是个装WindowState的容器，从其构造函数可知，内部持有的token本质就是个binder对象，并通过DisplayContent.addWindowToken在DisplayContent中记录了token和WindowToken的对应关系。
 
+对于应用来说，WindowToken其实就是ActivityRecord（其继承于WindowToken），代表了客户端一个具体的Activity。
+
+DisplayContent.addWindowToken添加binder和WindowToken是在启动应用时，调用流程如下：
+
+```java
+ActivityStarter.startActivityUnchecked -> startActivityInner  -> addOrReparentStartingActivity  ->Task.addChild -> TaskFragment.addChild  -> WindowContainer.addChild ->  WindowContainer.setParent->ActivityRecord.onDisplayChanged -> WindowToken.onDisplayChanged->DisplayContent.reParentWindowToken ->DisplayContent.addWindowToken
 ```
-//
+
+调用流程的代码不再细看，我们关注的是DisplayContent.addWindowToken时填加的token和windowToken。
+
+```java
+//ActivityRecord.java
+//继承WindowToken
+public final class ActivityRecord extends WindowToken {
+    private ActivityRecord(ActivityTaskManagerService _service, WindowProcessController _caller...){
+        //添加到DisplayContent里的token，其实就是这里随意new的一个本地binder，里面啥也没，其实就是作为此ActivityRecord的一个凭证，wms就可以通过这个binder找到此WindowToken，也就是此ActivityRecord
+        super(_service.mWindowManager, new Token(), TYPE_APPLICATION, true,null, false );
+    }
+    private static class Token extends Binder {
+        public String toString() {
+            return "Token{...}";
+        }
+    }
+}
+
+//父类WindowToken.java
+final IBinder token;
+protected WindowToken(WindowManagerService service, IBinder _token...){
+    token = _token;
+    //...
+}
+
+//DisplayContent.java
+void reParentWindowToken(WindowToken token) {
+    final DisplayContent prevDc = token.getDisplayContent();
+    if (prevDc == this) {
+        return;
+    }
+    //1 这里往DisplayContent里绑定了token和WindowToken
+    addWindowToken(token.token, token);
+}
+void addWindowToken(IBinder binder, WindowToken token) {
+    //...
+    mTokenMap.put(binder, token);
+}
 ```
 
+从注释1可以看到ActivityRecord里的token作为key，ActivityRecord这个WindowToken作为value存进了DisplayContent里。
 
+综上，一个activity对应服务端的一个ActivityRecord（WindowToken），打开多个Activity就有多个ActivityRecord。如果在某个Activity里弹dialog时，此dialog会用此Activity的WindowToken，在wms.addWindow时会创建此dialog的WindowState，把此WindowState添加到依附的WindowToken里，所以WindowToken本质是个WindowState的容器，负责装WindowState，在绘制时会根据此容器的所有的WindowState来组合显示。
 
+##### DisplayContent
+
+上面WindowToken如果理解的话，DisplayContent和WindowState就很好理解了。
+
+DisplayContent是Android4.2为支持多屏幕显示而提出的概念，一个DisplayContent对象就代表了一块屏幕信息，属于同一个DisplayContent的window对象会被绘制在同一块屏幕上，在添加窗口时可以指定要添加到哪个DisplayContent对应的id里，即在哪块屏幕显示。虽然手机只有一个显示屏，但是可以创建多个DisplayContent对象，比如投屏时可以创建一个虚拟的DisplayContent。
