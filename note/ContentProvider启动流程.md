@@ -8,7 +8,7 @@ ContentProvider作为四大组件之一，主要负责为其他应用提供数�
 
 ##### 使用
 
-参照示例[MyContentProvider](https://github.com/beyond667/PaulTest/blob/master/server/src/main/java/com/paul/test/server/provider/MyContentProvider.java) ，本文只简单介绍使用流程。  
+使用流程参照示例[MyContentProvider](https://github.com/beyond667/PaulTest/blob/master/server/src/main/java/com/paul/test/server/provider/MyContentProvider.java) ，本文只介绍其使用原理。  
 
 内容提供者进程：继承ContentProvider抽象类，实现其6个抽象方法（增删改查等），并在manifest中定义authorities
 
@@ -50,7 +50,7 @@ class ContextImpl extends Context {
 }
 ```
 
-以上代码可以看到，getContentResolver拿到的实际是ApplicationContentResolver对象，此对象在ContextImpl初始化的时候也构建了ApplicationContentResolver对象，并且还持有了ActivityThread对象。由于ApplicationContentResolver未重写query方法，所以query实际调用的还是子类ContentResolver的query方法
+以上代码可以看到，getContentResolver拿到的实际是ApplicationContentResolver对象，在ContextImpl初始化的时候构建了ApplicationContentResolver对象，此对象内部还持有了ActivityThread对象。由于ApplicationContentResolver未重写query方法，所以query实际调用的还是子类ContentResolver的query方法
 
 >frameworks/base/core/java/android/content/ContentResolver.java
 
@@ -134,7 +134,7 @@ public final IContentProvider acquireProvider(
 
 + 注释1会根据auth和userid组成的key去mProviderMap缓存中拿，如果之前已经访问过此provider，会在注释3 installProvider里存到mProviderMap缓存中，这时就直接返回。拿不到就往下走注释2
 + 注释2通过AMS去获取ContentProviderHolder对象，这个对象能在进程间传递，肯定是实现了Parcelable接口，此对象里还包含了IContentProvider代理对象。
-+ 注释3对拿到的provider进行安装，以便后面使用，这里会把拿到的provider存进mProviderMap缓存。需要注意此处调用installProvider传的holder不为空，并且此holder是从ams返回的，installProvider我们后面再看。
++ 注释3对拿到的provider进行安装，以便后面使用，这里会把拿到的provider存进mProviderMap缓存。需要注意此处调用installProvider传的holder不为空，并且此holder是从ams返回的，代表此处是客户端调用的，installProvider在后面服务器启动ContentProvider时也会调用到。
 
 我们看继续看注释2处AMS怎么获取ContentProviderHolder对象
 
@@ -147,7 +147,7 @@ public final ContentProviderHolder getContentProvider(IApplicationThread caller,
 }
 ```
 
-Android13上这里抽了个帮助类，专门维护ContentProvider
+Android13上这里抽了个帮助类ContentProviderHelper，专门维护ContentProvider
 
 > frameworks/base/services/core/java/com/android/server/am/ContentProviderHelper.java
 
@@ -247,7 +247,7 @@ private ContentProviderHolder getContentProviderImpl(IApplicationThread caller, 
             mProviderMap.putProviderByClass(comp, cpr);
         }
         mProviderMap.putProviderByName(name, cpr);
-        //15 构建AMS与此ContentProvider的连接对象ContentProviderConnection
+        //15 构建AMS与此ContentProvider的连接对象ContentProviderConnection，并把其设为等待状态
         conn = incProviderCountLocked(r, cpr, token, callingUid, callingPackage, callingTag,
                                       stable, false, startTime, mService.mProcessList, expectedUserId);
         if (conn != null) {
@@ -260,6 +260,8 @@ private ContentProviderHolder getContentProviderImpl(IApplicationThread caller, 
     boolean timedOut = false;
      synchronized (cpr) {
          // 16 while循环等待provider启动，没启动的话一直等待到设置的超时时长
+         // 注：ContentProvider没启动时ContentProviderRecord里的provider是空，
+         //    启动后会给其赋值并执行其notifyAll来唤醒这里的等待
          while (cpr.provider == null) {
              final long wait = Math.max(0L, timeout - SystemClock.uptimeMillis());
              if (conn != null) {
@@ -306,7 +308,7 @@ public boolean canRunHere(ProcessRecord app) {
 
 ##### 进程存在
 
-先看存在的话调用ActivityThread.scheduleInstallProvider
+先看存在的话调用ActivityThread.scheduleInstallProvider通知目标客户端启动ContentProvider
 
 ```java
 public final class ActivityThread extends ClientTransactionHandler{
@@ -380,6 +382,7 @@ private ContentProviderHolder installProvider(Context context,ContentProviderHol
     
     
     IBinder jBinder = provider.asBinder();
+    //localProvider不为空，说明是服务端
     if (localProvider != null) {
         ComponentName cname = new ComponentName(info.packageName, info.name);
         ProviderClientRecord pr = mLocalProvidersByName.get(cname);
@@ -387,16 +390,19 @@ private ContentProviderHolder installProvider(Context context,ContentProviderHol
         if (pr != null) {
             provider = pr.mProvider;
         } else {
+            //因为服务端此时的holder还为空，这里需要新建holder，服务端最终返回的就是此对象；
+            //客户端由于传进来的就有holder，最终也是返回的其传进来的holder
             holder = new ContentProviderHolder(info);
             holder.provider = provider;
             holder.noReleaseNeeded = true;
+            //服务端通过installProviderAuthoritiesLocked来获取ProviderClientRecord，并放进缓存，要返回的ContentProviderHolder也在里面
             pr = installProviderAuthoritiesLocked(provider, localProvider, holder);
             mLocalProviders.put(jBinder, pr);
             mLocalProvidersByName.put(cname, pr);
         }
         retHolder = pr.mHolder;
     } else {
-        //7 客户端从缓存拿ProviderRefCount
+        //7 客户端从mProviderRefCountMap缓存拿ProviderRefCount
         ProviderRefCount prc = mProviderRefCountMap.get(jBinder);
         if (prc != null) {
             //...
@@ -422,13 +428,13 @@ private ContentProviderHolder installProvider(Context context,ContentProviderHol
 
 installProvider方法看着很复杂，其实主要处理客户端和服务端的contentProvider的安装，对服务端来说：
 
-+ 注释1处传的是空，走注释2 3 4 6的逻辑
++ 注释1处传的ContentProviderHolder是空，走注释2 3 4 6的逻辑
 + 注释2和3通过类加载器加载ContentProvider实例对象，并获取其代理对象provider，并在4处执行contentProvider.attachInfo，里面会执行ContentProvider.onCreate方法
 + 注释6服务端从缓存拿ProviderClientRecord，拿不到的话就通过installProviderAuthoritiesLocked来获取，并放进缓存
 
 对于客户端来说
 
-+ 注释1处传的holder不为空，因为客户端拿到的是ams返回的代理对象，走注释5 7 8 9的逻辑
++ 注释1处传的ContentProviderHolder不为空，因为客户端拿到的是ams返回的代理对象，走注释5 7 8 9的逻辑
 + 注释7客户端从缓存拿ProviderRefCount，拿不到在注释8也通过installProviderAuthoritiesLocked来获取ProviderClientRecord，并和holder一起封装到ProviderRefCount里，并以binder作为key存进缓存，这样客户端后面就可以通过这个缓存拿到holder和ProviderClientRecord
 
 注释4的attachInfo
@@ -444,6 +450,29 @@ private void attachInfo(Context context, ProviderInfo info, boolean testing) {
     }
 }
 ```
+
+再看installProviderAuthoritiesLocked
+
+```java
+private ProviderClientRecord installProviderAuthoritiesLocked(IContentProvider provider,
+                                                              ContentProvider localProvider, ContentProviderHolder holder) {
+    final String auths[] = holder.info.authority.split(";");
+    final int userId = UserHandle.getUserId(holder.info.applicationInfo.uid);
+    //根据传进来的IContentProvider，ContentProvider，ContentProviderHolder初始化ProviderClientRecord
+    final ProviderClientRecord pcr = new ProviderClientRecord(auths, provider, localProvider, holder);
+    for (String auth : auths) {
+        final ProviderKey key = new ProviderKey(auth, userId);
+        //mProviderMap缓存里没有ProviderClientRecord就存进去
+        final ProviderClientRecord existing = mProviderMap.get(key);
+        if (existing != null) {} else {
+            mProviderMap.put(key, pcr);
+        }
+    }
+    return pcr;
+}
+```
+
+其实就是根据传进来的IContentProvider，ContentProvider，ContentProviderHolder初始化ProviderClientRecord，客户端和服务端都放进其进程的mProviderMap缓存后就返回。
 
 ##### 进程不存在
 
@@ -470,8 +499,8 @@ private boolean attachApplicationLocked(@NonNull IApplicationThread thread,
 }
 ```
 
-+ 注释1通过generateApplicationProvidersLocked获取ProviderInfo列表
-+ 注释2通知服务端AMS已经绑定成功，这个启动流程已经很熟悉了
++ 注释1通过generateApplicationProvidersLocked获取ProviderInfo列表，并往目标进程缓存所有ContentProviderRecord
++ 注释2通知目标进程AMS已经绑定成功，这个启动流程已经很熟悉了
 
 ```java
 List<ProviderInfo> generateApplicationProvidersLocked(ProcessRecord app) {
@@ -507,7 +536,7 @@ void installProvider(String name, ContentProviderRecord provider) {
 ```
 
 + 注释1通过pms拿所有的ContentProvider列表
-+ 注释2遍历1拿到的列表，调用ProcessProviderRecord.installProvider，其实相当于往ProcessRecord.mProviders的缓存mPubProviders里存了所有配置的ContentProvider，AMS这里记录后通知服务端进程已经绑定成功，我们继续看AplicationThread.bindApplication->H.handMessage->ActivityThread.handleBindApplication
++ 注释2遍历1拿到的列表，调用ProcessProviderRecord.installProvider，其实相当于往ProcessRecord.mProviders的缓存mPubProviders里存了所有配置的ContentProviderRecord，AMS这里记录后通知目标进程已经绑定成功，我们继续看目标进程AplicationThread.bindApplication->H.handMessage->ActivityThread.handleBindApplication
 
 ```java
 private void handleBindApplication(AppBindData data) {
@@ -555,6 +584,7 @@ void publishContentProviders(IApplicationThread caller, List<ContentProviderHold
         if (src == null || src.info == null || src.provider == null) {
             continue;
         }
+        //在getContentProviderImpl时已经把ContentProviderRecord缓存进了目标进程的
         ContentProviderRecord dst = r.mProviders.getProvider(src.info.name);
         if (dst == null) {
             continue;
@@ -676,7 +706,7 @@ public boolean onTransact(int code, Parcel data, Parcel reply, int flags){
         if (cursor != null) {
             CursorToBulkCursorAdaptor adaptor = null;
 
-            //2 服务端也创建个CursorToBulkCursorAdaptor把结果和客户端的IContentObserver关联起来
+            //2 服务端也创建个CursorToBulkCursorAdaptor把cursor结果和客户端的IContentObserver关联起来
             adaptor = new CursorToBulkCursorAdaptor(cursor, observer,getProviderName());
             cursor = null;
 
@@ -699,7 +729,7 @@ public boolean onTransact(int code, Parcel data, Parcel reply, int flags){
 + 注释1调用我们自定义的ContentProvider的query方法，把结果放进cursor
 + 注释2服务端也创建个CursorToBulkCursorAdaptor把结果和客户端的IContentObserver关联起来，这里并未真正执行查询，只是构建了查询对象
 + 3 关键步骤，获取BulkCursorDescriptor，这里会真正创建共享内存并真正执行查询，结果会放进共享内存
-+ 4 把查询结果写进reply返回客户端
++ 4 把包装到BulkCursorDescriptor里的查询结果写进reply返回客户端，
 
 >frameworks/base/core/java/android/database/CursorToBulkCursorAdaptor.java
 
@@ -707,6 +737,7 @@ public boolean onTransact(int code, Parcel data, Parcel reply, int flags){
 public BulkCursorDescriptor getBulkCursorDescriptor() {
     synchronized (mLock) {
         BulkCursorDescriptor d = new BulkCursorDescriptor();
+        //这里指定了BulkCursorDescriptor的cursor是CursorToBulkCursorAdaptor
         d.cursor = this;
         d.columnNames = mCursor.getColumnNames();
         d.wantsAllOnMoveCalls = mCursor.getWantsAllOnMoveCalls();
@@ -751,6 +782,9 @@ public class SQLiteCursor extends AbstractWindowedCursor {
 }
 ```
 
++ 注释1 没初始化CursorWindow就先初始化，已经初始化过就clear下
++ 注释2 fillWindow才是真正执行查询结果，并把结果fill进CursorWindow的共享内存里
+
 注释1会保证一定有CursorWindow，那我们继续看这个关键类CursorWindow
 
 > frameworks/base/core/java/android/database/CursorWindow.java
@@ -790,7 +824,7 @@ static jlong nativeCreate(JNIEnv* env, jclass clazz, jstring nameObj, jint curso
 }
 ```
 
-根据注释1CursorWindow::create创建JNI层的CursorWindow对象
+注释1CursorWindow::create创建JNI层的CursorWindow对象
 
 > framworks/base/libs/androidfw/CursorWindow.cpp
 
@@ -826,9 +860,9 @@ status_t CursorWindow::maybeInflate() {
 
     String8 ashmemName("CursorWindow: ");
     ashmemName.append(mName);
-	//1 创建共享内存的文件描述符
+	//创建共享内存的文件描述符
     ashmemFd = ashmem_create_region(ashmemName.string(), mInflatedSize);
-	//2 加载到内存
+	//加载到内存
     newData = ::mmap(nullptr, mInflatedSize, PROT_READ | PROT_WRITE, MAP_SHARED, ashmemFd, 0);
     if (newData == MAP_FAILED) {
         goto fail_silent;
@@ -841,7 +875,7 @@ status_t CursorWindow::maybeInflate() {
 }
 ```
 
-由上面可以看到JNI层创建了个CursorWindow对象，并申请了共享内存fd，ContentProvider共享内存即通过此fd实现的。这里只是申请了共享内存空间，此时还没塞数据，后面mQuery.fillWindow会把查到的数据放进共享内存。这里简单看下调用流程，暂不关注怎么查数据，只关注数据传输
+由上面可以看到JNI层创建了个CursorWindow对象，并申请了共享内存fd，ContentProvider共享内存即通过此fd实现的。这里只是申请了共享内存空间，此时还没塞数据，上面注释2 fillWindow会把查到的数据放进共享内存。这里简单看下调用流程，暂不关注怎么查数据，只关注数据传输
 
 ```java
 //SQLiteQuery.java 
@@ -895,7 +929,7 @@ static CopyRowResult copyRow(JNIEnv* env, CursorWindow* window...) {
 }
 ```
 
-再看下CursorWindow.putString
+以SQLITE_TEXT这个类型为例看下CursorWindow.putString
 
 > framworks/base/libs/android_database_SQLiteConnection.cpp
 
@@ -925,6 +959,9 @@ status_t CursorWindow::putBlobOrString(uint32_t row, uint32_t column,
 ```java
 public CursorWindow window;
 public void writeToParcel(Parcel out, int flags) {
+    //这个cursor在getBulkCursorDescriptor时已指定CursorToBulkCursorAdaptor
+    out.writeStrongBinder(cursor.asBinder());
+    //...
     if (window != null) {
         out.writeInt(1);
         window.writeToParcel(out, flags);
@@ -952,12 +989,13 @@ status_t CursorWindow::writeToParcel(Parcel* parcel) {
 }
 ```
 
-把parcel写进共享内存的文件描述符，到这里服务端数据已经准备好了。继续看客户端通过binder通信拿结果。我们从上文这里继续看客户端流程
+把parcel写进共享内存的文件描述符，到这里服务端数据已经准备好了。继续看客户端通过binder通信拿结果。我们从上文这里继续看客户端query方法
 
 ```java
+//ContentProviderNative.java的query方法
 mRemote.transact(IContentProvider.QUERY_TRANSACTION, data, reply, 0);
 if (reply.readInt() != 0) {
-    //3 服务端拿到BulkCursorDescriptor，并调用BulkCursorToCursorAdaptor.initialize实例化本地对象
+    //从服务端拿到BulkCursorDescriptor，并调用BulkCursorToCursorAdaptor.initialize实例化本地对象
     BulkCursorDescriptor d = BulkCursorDescriptor.CREATOR.createFromParcel(reply);
     Binder.copyAllowBlocking(mRemote, (d.cursor != null) ? d.cursor.asBinder() : null);
     adaptor.initialize(d);
@@ -992,7 +1030,7 @@ public final class BulkCursorDescriptor implements Parcelable {
 }
 ```
 
-这里继续实例化CursorWindow
+这里客户端也会实例化CursorWindow，以获取服务端的共享数据
 
 ```java
 public class CursorWindow extends SQLiteClosable implements Parcelable {
