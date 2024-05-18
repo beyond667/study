@@ -348,6 +348,7 @@ protected WindowToken(WindowManagerService service, IBinder _token...){
 }
 
 //DisplayContent.java
+private final HashMap<IBinder, WindowToken> mTokenMap = new HashMap();
 void reParentWindowToken(WindowToken token) {
     final DisplayContent prevDc = token.getDisplayContent();
     if (prevDc == this) {
@@ -371,3 +372,178 @@ void addWindowToken(IBinder binder, WindowToken token) {
 上面WindowToken如果理解的话，DisplayContent和WindowState就很好理解了。
 
 DisplayContent是Android4.2为支持多屏幕显示而提出的概念，一个DisplayContent对象就代表了一块屏幕信息，属于同一个DisplayContent的window对象会被绘制在同一块屏幕上，在添加窗口时可以指定要添加到哪个DisplayContent对应的id里，即在哪块屏幕显示。虽然手机只有一个显示屏，但是可以创建多个DisplayContent对象，比如投屏时可以创建一个虚拟的DisplayContent。
+
+DisplayContent的初始化调用流程如下：
+
+SystemServer.startOtherServices -> ams.setWindowManager -> ams.setWindowManager -> RootWindowContainer.setWindowManager->new DisplayContent(display,this)
+
+```java
+//RootWindowContainer.java
+public class RootWindowContainer extends WindowContainer<DisplayContent>{
+    void setWindowManager(WindowManagerService wm) {
+        mWindowManager = wm;
+        mDisplayManager = mService.mContext.getSystemService(DisplayManager.class);
+        mDisplayManager.registerDisplayListener(this, mService.mUiHandler);
+        //1 通过DisplayManager获取所有的Display
+        final Display[] displays = mDisplayManager.getDisplays();
+        for (int displayNdx = 0; displayNdx < displays.length; ++displayNdx) {
+            final Display display = displays[displayNdx];
+            //2 基于display和RootWindowContainer创建DisplayContent
+            final DisplayContent displayContent = new DisplayContent(display, this);
+            //3 把displayContent添加到本容器中
+            addChild(displayContent, POSITION_BOTTOM);
+            if (displayContent.mDisplayId == DEFAULT_DISPLAY) {
+                mDefaultDisplay = displayContent;
+            }
+        }
+        //...
+    }
+}
+
+//父类WindowContainer.java
+// List of children for this window container. List is in z-order as the children appear on
+// screen with the top-most window container at the tail of the list.
+protected final WindowList<E> mChildren = new WindowList<E>();
+void addChild(E child, int index) {
+    //...
+    mChildren.add(index, child);
+}
+//WindowList.java 
+class WindowList<E> extends ArrayList<E> {}
+```
+
++ 注释1通过displayManager去获取所有的display信息，只有一个显示的话只返回一个id为0的display对象，用户也可以在同一块屏幕上创建虚拟的display
+
++ 注释2基于display和本容器创建DisplayContent对象
++ 注释3把displayContent添加到本容器，RootWindowContainer理解成一个装DisplayContent的容器
+
+基于以上可以认为，如果有多块屏幕，肯定拿到的是多个display，但是即使只有一块屏幕，也有可能创建多个display，一个display关联一个displayContent，并且都加到同一个RootWindowContainer容器里。其实多屏显示就是通过DisplayManager去管理多个display，关于多屏幕显示会在后面再研究。
+
+再看DisplayContent的构造函数
+
+> frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+
+```java
+DisplayContent(Display display, RootWindowContainer root) {
+    mRootWindowContainer = root;
+    mAtmService = mWmService.mAtmService;
+    mDisplay = display;
+    mDisplayId = display.getDisplayId();
+    //display id为0代表默认显示屏
+    isDefaultDisplay = mDisplayId == DEFAULT_DISPLAY;
+    if (isDefaultDisplay) {
+        mWmService.mPolicy.setDefaultDisplay(this);
+    }
+    //...
+    //显示策略
+    mDisplayPolicy = new DisplayPolicy(mWmService, this);
+    //旋转角度，可以控制显示横竖屏
+    mDisplayRotation = new DisplayRotation(mWmService, this);
+   //...
+}
+```
+
+可以看到DisplayContent其实就是对Display做了包装，控制该display的所有信息，比如显示策略，旋转角度，以及WindowToken等。
+
+##### WindowState
+
+WindowState表示一个窗口的所有属性，是WMS事实上的窗口。
+
+我们继续看下wms.addWindow中关于WindowState的部分
+
+```java
+//wms.java
+final HashMap<IBinder, WindowState> mWindowMap = new HashMap<>();
+public int addWindow(Session session, IWindow client, LayoutParams attrs){
+    //...省略前面以及WindowToken部分，可以看上面WindowToken部分
+    //1 基于session，windowtoken和IWindow等初始化windowState
+    final WindowState win = new WindowState(this, session, client, token, parentWindow,
+                                            appOp[0], attrs, viewVisibility, session.mUid, userId,
+                                            session.mCanAddInternalSystemWindow);
+    
+    //2 内部通过Session把记录的窗口数加1
+    win.attach();
+    //3 wms也缓存了binder和windowState
+    mWindowMap.put(client.asBinder(), win);
+    
+    //在windowToken小节已经解释了，把WindowState的容器WindowToken添加新new出来的WindowState
+    //其实就是WindowState和WindowToken进行了双向绑定，既可以通过WindowState获取WindowToken容器
+    //也可以根据WindowToken去遍历所有的WindowState
+    win.mToken.addWindow(win);
+    
+    //设置窗口动画
+    final WindowStateAnimator winAnimator = win.mWinAnimator;
+    winAnimator.mEnterAnimationPending = true;
+    winAnimator.mEnteringAnimation = true;
+
+    //处理输入和焦点
+    displayContent.getInputMonitor().setUpdateInputWindowsNeededLw();
+    boolean focusChanged = false;
+    if (win.canReceiveKeys()) {
+        focusChanged = updateFocusedWindowLocked(UPDATE_FOCUS_WILL_ASSIGN_LAYERS,false);
+        if (focusChanged) {
+            imMayMove = false;
+        }
+    }
+    //...到这里基本上WMS.addWindow大部分工作都做完了
+}
+```
+
++ 注释1在new WindowState时是基于session，windowtoken和IWindow等来初始化的
++ 注释2调用WindowState通知session把窗口数加1
++ 注释3 wms也缓存了IWindow这个binder和WindowState的映射关系
+
+再看WindowState
+
+```java
+//WindowState.java
+WindowState(WindowManagerService service, Session s, IWindow c, WindowToken token...){
+    mSession = s;
+    mClient = c;
+    mToken = token;
+    DeathRecipient deathRecipient = new DeathRecipient();
+    c.asBinder().linkToDeath(deathRecipient, 0);
+    //基于窗口类型计算主序，子序
+    if (mAttrs.type >= FIRST_SUB_WINDOW && mAttrs.type <= LAST_SUB_WINDOW) {
+        mBaseLayer = mPolicy.getWindowLayerLw(parentWindow)
+            * TYPE_LAYER_MULTIPLIER + TYPE_LAYER_OFFSET;
+        mSubLayer = mPolicy.getSubWindowLayerFromTypeLw(a.type);
+    } else {
+        mBaseLayer = mPolicy.getWindowLayerLw(this)
+            * TYPE_LAYER_MULTIPLIER + TYPE_LAYER_OFFSET;
+        mSubLayer = 0;
+    }
+    mWinAnimator = new WindowStateAnimator(this);
+    mWinAnimator.mAlpha = a.alpha;
+}
+void attach() {
+    mSession.windowAddedLocked();
+}
+
+//Session.java
+private int mNumWindow = 0;
+void windowAddedLocked() {
+    //从这里可以看到只有应用第一次添加窗口时才会创建一次SurfaceSession
+    if (mSurfaceSession == null) {
+        mSurfaceSession = new SurfaceSession();
+        mService.mSessions.add(this);
+        if (mLastReportedAnimatorScale != mService.getCurrentAnimatorScale()) {
+            mService.dispatchNewAnimatorScaleLocked(this);
+        }
+    }
+    mNumWindow++;
+}
+void windowRemovedLocked() {
+    mNumWindow--;
+    killSessionLocked();
+}
+private void killSessionLocked() {
+    //只要窗口数大于0就不清除此Session
+    if (mNumWindow > 0 || !mClientDead) {
+        return;
+    }
+    mService.mSessions.remove(this);
+    //...
+}
+```
+
