@@ -114,13 +114,24 @@ public void addView(View view... Window parentWindow...) {
 }
 //ViewRootImpl.java
 final IWindowSession mWindowSession;
+View mView;
 public ViewRootImpl(Context context, Display display) {
     //WindowManagerGlobal单例获取该应用唯一的Session，记录到本地mWindowSession中
     //关于Session看下一小节
     this(context, display, WindowManagerGlobal.getWindowSession(), new WindowLayout());
 }
 public void setView(View view, WindowManager.LayoutParams attrs...) {
+    //这个view也就是DecorView，一个ViewRootImpl对应一个DecorView
+    mView = view;
 	//...
+    // Schedule the first layout -before- adding to the window
+    // manager, to make sure we do the relayout before receiving
+    // any other events from the system.
+    // 添加窗口前先完成第一次layout布局，以确保收到任何系统事件后重新布局，
+    // 此方法最终会调performTraversals来完成view绘制（view绘制的入口）
+    requestLayout();
+    //...
+    // 调用session.addToDisplayAsUser通知wms添加窗口
     res = mWindowSession.addToDisplayAsUser(mWindow, mWindowAttributes...);
     //...
 }
@@ -525,6 +536,7 @@ private int mNumWindow = 0;
 void windowAddedLocked() {
     //从这里可以看到只有应用第一次添加窗口时才会创建一次SurfaceSession
     if (mSurfaceSession == null) {
+        //1 这里会创建SurfaceSession
         mSurfaceSession = new SurfaceSession();
         mService.mSessions.add(this);
         if (mLastReportedAnimatorScale != mService.getCurrentAnimatorScale()) {
@@ -547,3 +559,124 @@ private void killSessionLocked() {
 }
 ```
 
+WindowState的构造函数中绑定了Iwindow，Session，WindowToken，并计算了窗口的主序和子序等。
+
+注释1在调用WindowState的attach方法时，会在Session里把窗口数加1，如果是应用首次添加窗口，会在native层创建Surface，关于SurfaceFlinger的后面讲的时候会把链接放这里。
+
+另需注意WindowState里绑的IWindow其实是客户端的IWindow.Stub
+
+```java
+//ViewRootImpl.java
+final W mWindow;
+public void setView(...){
+    //...
+    mWindowSession.addToDisplayAsUser(mWindow,...);
+    //...
+}
+static class W extends IWindow.Stub {
+    private final WeakReference<ViewRootImpl> mViewAncestor;
+    private final IWindowSession mWindowSession;
+
+    W(ViewRootImpl viewAncestor) {
+        mViewAncestor = new WeakReference<ViewRootImpl>(viewAncestor);
+        mWindowSession = viewAncestor.mWindowSession;
+    }
+    public void resized(){}
+    public void showInsets(){}
+    public void hideInsets(){}
+}
+```
+
+从上面可以看到IWindow其实就是客户端的IWindow.Stub这个binder的代理端，WMS拿到此binder方便操作客户端的“窗口”，W内部是持有了ViewRootImpl的弱引用，所以本质上是WMS通过操作WindowState里的IWindow这个binder，来控制客户端的ViewRootImpl，ViewRootImpl持有了DecorView，后续的窗口resize，事件分发等就通过ViewRootImpl来控制。
+
+##### 主序，子序，窗口类型
+
+> 手机屏幕以左上角为原点，向右为X轴方向，向下为Y轴方向，为方便窗口管理的显示次序，手机的屏幕被扩展了一个三维的空间，即多定义了一个Z轴，其方向为垂直于屏幕指向屏幕外，多个窗口按照前后顺序排列在这个虚拟的Z轴上，此窗口的显示次序又被称为Z序（Z-Order）
+
+在上面WindowState构造函数中根据窗口类型计算了主序，子序
+
+```java
+//基于窗口类型计算主序，子序 TYPE_LAYER_MULTIPLIER==10000 TYPE_LAYER_OFFSET==1000
+if (mAttrs.type >= FIRST_SUB_WINDOW && mAttrs.type <= LAST_SUB_WINDOW) {
+    //如果是子窗口，就用父窗口的主序  
+    mBaseLayer = mPolicy.getWindowLayerLw(parentWindow)
+        * TYPE_LAYER_MULTIPLIER + TYPE_LAYER_OFFSET;
+    //根据窗口类型获取子序
+    mSubLayer = mPolicy.getSubWindowLayerFromTypeLw(a.type);
+} else {
+    //非子窗口，就根据窗口类型来计算主序
+    mBaseLayer = mPolicy.getWindowLayerLw(this)
+        * TYPE_LAYER_MULTIPLIER + TYPE_LAYER_OFFSET;
+    //子序设为0
+    mSubLayer = 0;
+}
+```
+
+这里牵涉到3个概念，窗口类型，主序，子序。
+
+窗口分为以下几类：
+
++ 应用窗口（1-99）：常见的Activity窗口，dialog即属于此区间（已验证，在同一activity弹dialog，activity的窗口类型为1，dialog为2，popupwindow为1000）
++ 子窗口（1000-1999）：PopupWindow，ContextMenu即属于此区间。子窗口不能独立存在，必须依附主窗口
++ 系统窗口（2000-2999）：状态栏，导航栏，输入法，壁纸，Toast等系统窗口。
+
+一般来说，窗口的层级越大的显示在最顶部，但是也不绝对，比如系统的壁纸窗口就在底部。
+
+> frameworks/base/core/java/android/view/WindowManager.java
+
+```java
+//WindowManager内部类LayoutParams
+public static class LayoutParams extends ViewGroup.LayoutParams implements Parcelable {
+    //应用窗口1-99
+    //应用的base窗口，主要就是Activity
+    public static final int TYPE_BASE_APPLICATION   = 1;
+    //普通应用窗口，但是必须要指定此窗口属于哪个activity token。Dialog默认会用此窗口类型
+    public static final int TYPE_APPLICATION        = 2;
+    //为应用启动时显示的特殊窗口，其实主要为了Anroid12后提出的Splash Screen功能
+    public static final int TYPE_APPLICATION_STARTING = 3;
+    //应用窗口的结束窗口
+    public static final int LAST_APPLICATION_WINDOW = 99;
+    
+    //子窗口1000-1999
+    //子窗口的开始标记。PopupWindow即属于此
+    public static final int FIRST_SUB_WINDOW = 1000;
+    //后面都是子窗口的一些扩展窗口。比如子窗口的panel，media窗口
+    public static final int TYPE_APPLICATION_PANEL = FIRST_SUB_WINDOW;
+    public static final int TYPE_APPLICATION_MEDIA = FIRST_SUB_WINDOW + 1;
+    public static final int TYPE_APPLICATION_SUB_PANEL = FIRST_SUB_WINDOW + 2;
+    public static final int TYPE_APPLICATION_ATTACHED_DIALOG = FIRST_SUB_WINDOW + 3;
+    public static final int TYPE_APPLICATION_MEDIA_OVERLAY  = FIRST_SUB_WINDOW + 4;
+    public static final int TYPE_APPLICATION_ABOVE_SUB_PANEL = FIRST_SUB_WINDOW + 5;
+    public static final int LAST_SUB_WINDOW = 1999;
+    
+    //系统窗口2000-2999
+    //系统窗口开始标记
+    public static final int FIRST_SYSTEM_WINDOW     = 2000;
+    //状态栏
+    public static final int TYPE_STATUS_BAR         = FIRST_SYSTEM_WINDOW;
+    public static final int TYPE_SEARCH_BAR         = FIRST_SYSTEM_WINDOW+1;
+    //通话窗口，已过时，用TYPE_APPLICATION_OVERLAY
+    @Deprecated
+    public static final int TYPE_PHONE              = FIRST_SYSTEM_WINDOW+2;
+    //系统警告窗口，已过时，用TYPE_APPLICATION_OVERLAY
+    @Deprecated
+    public static final int TYPE_SYSTEM_ALERT       = FIRST_SYSTEM_WINDOW+3;
+    //锁屏窗口
+    public static final int TYPE_KEYGUARD           = FIRST_SYSTEM_WINDOW+4;
+    //Toast窗口，已过时，用TYPE_APPLICATION_OVERLAY
+    @Deprecated
+    public static final int TYPE_TOAST              = FIRST_SYSTEM_WINDOW+5;
+    //系统overlay窗口
+    public static final int TYPE_APPLICATION_OVERLAY = FIRST_SYSTEM_WINDOW + 38;
+    public static final int TYPE_SYSTEM_DIALOG      = FIRST_SYSTEM_WINDOW+8;
+    public static final int TYPE_KEYGUARD_DIALOG    = FIRST_SYSTEM_WINDOW+9;
+    //输入法窗口
+    public static final int TYPE_INPUT_METHOD       = FIRST_SYSTEM_WINDOW+11;
+    //壁纸窗口
+    public static final int TYPE_WALLPAPER          = FIRST_SYSTEM_WINDOW+13;
+    public static final int LAST_SYSTEM_WINDOW      = 2999;
+    //...
+}
+```
+
+这里有个细节，比如我们在Activity中弹出Dialog，并没有指定其窗口类型也能正常弹出来，打印时Activity窗口类型为1，此Dialog窗口类型为2，而显示PopupWindow时的窗口类型为1000，这里有个疑问，为什么dialog不是子窗口类型，而PopupWindow是子窗口呢？这里可以这两个控件的设计初衷来分析下，PopupWindow的显示必须指定一个View，即通过showAtLocation时必须传个view，代表此PopupWindow相对于此view的位置，即PopupWindow和此view是完全绑定的，可以理解成其“子窗口”，而dialog并不依赖于具体view，而是需要传Context上下文，不止在activity中能调，在其他组件，比如Service也能调，但是此时需要指定其窗口类型为TYPE_SYSTEM_ALERT等系统类型(系统应用才可以)，dialog并不需要依赖父窗口。
