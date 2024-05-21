@@ -6,7 +6,9 @@ WMS（WindowManagerService）是继AMS,PMS之后一个非常复杂又非常重�
 
 先有个模糊的过程：用户定义的layout在启动activity时通过setContentView加载，此过程会把xml布局“翻译”成具体的view，客户端通知WMS添加此view，WMS构建个此“窗口”，这里有可能有多个应用同时显示，比如状态栏，导航栏，所以wms可能同时构建几个要显示的“窗口”，就需要把这几个窗口做个合并，哪个窗口再哪里显示，拼接出来的数据再通知SurfaceFlinger去显示。
 
-上面简化的流程是为了引出一些基本的概念。
+上面简化的流程是为了引出一些基本的概念。  
+
+如果本身就了解概念的，可以直接跳过此节，到WMS启动流程。
 
 + Window
 + Session
@@ -85,6 +87,7 @@ public void handleResumeActivity(ActivityClientRecord r...) {
     ViewManager wm = a.getWindowManager();
     WindowManager.LayoutParams l = r.window.getAttributes();
     a.mDecor = decor;
+    //指定activity的窗口类型为1
     l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
     l.softInputMode |= forwardBit;
 	//调用WindowManagerImpl.addView,WindowManagerImpl又调WindowManagerGlobal.addView
@@ -454,7 +457,7 @@ DisplayContent(Display display, RootWindowContainer root) {
 }
 ```
 
-可以看到DisplayContent其实就是对Display做了包装，控制该display的所有信息，比如显示策略，旋转角度，以及WindowToken等。
+可以看到DisplayContent其实就是对Display做了包装，控制该display的所有信息，比如显示策略，旋转角度，以及在此屏幕上要显示的所有的WindowToken等。
 
 ##### WindowState
 
@@ -666,7 +669,7 @@ public static class LayoutParams extends ViewGroup.LayoutParams implements Parce
     //Toast窗口，已过时，用TYPE_APPLICATION_OVERLAY
     @Deprecated
     public static final int TYPE_TOAST              = FIRST_SYSTEM_WINDOW+5;
-    //系统overlay窗口
+    //系统overlay窗口，Android8.0之后用这个代替过时的系统窗口
     public static final int TYPE_APPLICATION_OVERLAY = FIRST_SYSTEM_WINDOW + 38;
     public static final int TYPE_SYSTEM_DIALOG      = FIRST_SYSTEM_WINDOW+8;
     public static final int TYPE_KEYGUARD_DIALOG    = FIRST_SYSTEM_WINDOW+9;
@@ -680,3 +683,341 @@ public static class LayoutParams extends ViewGroup.LayoutParams implements Parce
 ```
 
 这里有个细节，比如我们在Activity中弹出Dialog，并没有指定其窗口类型也能正常弹出来，打印时Activity窗口类型为1，此Dialog窗口类型为2，而显示PopupWindow时的窗口类型为1000，这里有个疑问，为什么dialog不是子窗口类型，而PopupWindow是子窗口呢？这里可以这两个控件的设计初衷来分析下，PopupWindow的显示必须指定一个View，即通过showAtLocation时必须传个view，代表此PopupWindow相对于此view的位置，即PopupWindow和此view是完全绑定的，可以理解成其“子窗口”，而dialog并不依赖于具体view，而是需要传Context上下文，不止在activity中能调，在其他组件，比如Service也能调，但是此时需要指定其窗口类型为TYPE_SYSTEM_ALERT等系统类型(系统应用才可以)，dialog并不需要依赖父窗口。
+
+```java
+//PopupWindow.java
+private int mWindowLayoutType = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL;
+public void showAtLocation(View parent, int gravity, int x, int y) {
+    mParentRootView = new WeakReference<>(parent.getRootView());
+    showAtLocation(parent.getWindowToken(), gravity, x, y);
+}
+public void showAtLocation(IBinder token, int gravity, int x, int y) {
+    if (isShowing() || mContentView == null) {
+        return;
+    }
+    //...
+    final WindowManager.LayoutParams p = createPopupLayoutParams(token);
+    preparePopup(p);
+    p.x = x;
+    p.y = y;
+    //把此PopupWindow的窗口通过wms添加进去
+    invokePopup(p);
+    //...
+}
+protected final WindowManager.LayoutParams createPopupLayoutParams(IBinder token) {
+    final WindowManager.LayoutParams p = new WindowManager.LayoutParams();
+    //mWindowLayoutType已定义窗口类型为：TYPE_APPLICATION_PANEL（1000）
+    p.type = mWindowLayoutType;
+    //...给其他参数赋值
+    return p;
+}
+
+private void invokePopup(WindowManager.LayoutParams p) {
+    //...
+    mWindowManager.addView(decorView, p);
+    //...
+}
+```
+
+再看下Dialog里的窗口类型
+
+```java
+//Dialog.java
+Dialog(Context context, int themeResId,boolean createContextThemeWrapper) {
+	//...
+    final Window w = new PhoneWindow(mContext);
+    mWindow = w;
+    //...
+}
+//PhoneWindow的父类Window.java
+private final WindowManager.LayoutParams mWindowAttributes =
+    new WindowManager.LayoutParams();
+//WindowManager的内部类LayoutParams
+public LayoutParams() {
+    super(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT);
+    type = TYPE_APPLICATION; //2
+    format = PixelFormat.OPAQUE;
+}
+```
+
+new PhoneWindow默认的窗口类型就是2  
+
+再看下Activity的窗口类型
+
+```java
+//ActivityThread.java
+public void handleResumeActivity(){
+    //...
+    WindowManager.LayoutParams l = r.window.getAttributes();
+    a.mDecor = decor;
+    //指定Activity的窗口类型为1
+    l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
+    //...
+    wm.addView(decor, l);
+    //...
+}
+```
+
+通过对比Activity，Dialog，PopupWindow可知，默认的窗口类型就是2，只不过Activity和PopupWindow都会在addView前设置下窗口类型。
+
+再继续看主序和子序
+
++ 主序：用来描述窗口及其子窗口在所有窗口中的显示位置。主序越大，则相对于其他窗口越靠前
++ 子序：描述一个子窗口在其兄弟窗口中的显示位置。子序越大，相对于其兄弟窗口越靠前。
+
+再重新看下这块计算主序和子序
+
+```java
+//基于窗口类型计算主序，子序 TYPE_LAYER_MULTIPLIER==10000 TYPE_LAYER_OFFSET==1000
+if (mAttrs.type >= FIRST_SUB_WINDOW && mAttrs.type <= LAST_SUB_WINDOW) {
+    //如果是子窗口，就用父窗口的主序  
+    mBaseLayer = mPolicy.getWindowLayerLw(parentWindow)
+        * TYPE_LAYER_MULTIPLIER + TYPE_LAYER_OFFSET;
+    //根据窗口类型获取子序
+    mSubLayer = mPolicy.getSubWindowLayerFromTypeLw(a.type);
+} else {
+    //非子窗口，就根据窗口类型来计算主序
+    mBaseLayer = mPolicy.getWindowLayerLw(this)
+        * TYPE_LAYER_MULTIPLIER + TYPE_LAYER_OFFSET;
+    //子序设为0
+    mSubLayer = 0;
+}
+```
+
+计算主序是根据getWindowLayerLw获取窗口类型对应的值，乘以10000再加1000的偏移量。计算子序是有子窗口时根据子窗口类型去获取对应的偏移量，没有子窗口时子序默认为0。
+
+> frameworks/base/services/core/java/com/android/server/policy/WindowManagerPolicy.java
+
+```java
+default int getWindowLayerLw(WindowState win) {
+    return getWindowLayerFromTypeLw(win.getBaseType(), win.canAddInternalSystemWindow());
+}
+default int getWindowLayerFromTypeLw(int type, boolean canAddInternalSystemWindow) {
+    return getWindowLayerFromTypeLw(type, canAddInternalSystemWindow,false);
+}
+default int getWindowLayerFromTypeLw(int type, boolean canAddInternalSystemWindow,boolean roundedCornerOverlay) {
+    //如果是应用窗口，直接返回2
+    if (type >= FIRST_APPLICATION_WINDOW && type <= LAST_APPLICATION_WINDOW) {
+        return APPLICATION_LAYER;
+    }
+    switch (type) {
+        case TYPE_WALLPAPER:
+            // wallpaper is at the bottom, though the window manager may move it.
+            return  1;
+        case TYPE_PRESENTATION:
+        case TYPE_PRIVATE_PRESENTATION:
+        case TYPE_DOCK_DIVIDER:
+        case TYPE_QS_DIALOG:
+        case TYPE_PHONE:
+            return  3;
+        case TYPE_SEARCH_BAR:
+            return  4;
+        case TYPE_INPUT_CONSUMER:
+            return  5;
+        case TYPE_SYSTEM_DIALOG:
+            return  6;
+        case TYPE_TOAST:
+            return  7;
+        case TYPE_PRIORITY_PHONE:
+            // SIM errors and unlock.  Not sure if this really should be in a high layer.
+            return  8;
+        case TYPE_SYSTEM_ALERT:
+            // like the ANR / app crashed dialogs
+            // Type is deprecated for non-system apps. For system apps, this type should be
+            // in a higher layer than TYPE_APPLICATION_OVERLAY.
+            return  canAddInternalSystemWindow ? 12 : 9;
+        case TYPE_APPLICATION_OVERLAY:
+            return  11;
+        case TYPE_INPUT_METHOD:
+            // on-screen keyboards and other such input method user interfaces go here.
+            return  13;
+        case TYPE_INPUT_METHOD_DIALOG:
+            // on-screen keyboards and other such input method user interfaces go here.
+            return  14;
+        case TYPE_STATUS_BAR:
+            return  15;
+        case TYPE_STATUS_BAR_ADDITIONAL:
+            return  16;
+        case TYPE_NOTIFICATION_SHADE:
+            return  17;
+        case TYPE_STATUS_BAR_SUB_PANEL:
+            return  18;
+        case TYPE_KEYGUARD_DIALOG:
+            return  19;
+        case TYPE_VOICE_INTERACTION_STARTING:
+            return  20;
+        case TYPE_VOICE_INTERACTION:
+            // voice interaction layer should show above the lock screen.
+            return  21;
+        case TYPE_VOLUME_OVERLAY:
+            // the on-screen volume indicator and controller shown when the user
+            // changes the device volume
+            return  22;
+        case TYPE_SYSTEM_OVERLAY:
+            // the on-screen volume indicator and controller shown when the user
+            // changes the device volume
+            return  canAddInternalSystemWindow ? 23 : 10;
+            //...
+        case TYPE_POINTER:
+            // the (mouse) pointer layer
+            return  35;
+        default:
+            Slog.e("WindowManager", "Unknown window type: " + type);
+            return 3;
+    }
+}
+```
+
+从这里可以看到为什么壁纸窗口会在所有窗口的底部，其返回值为1，而默认应用窗口直接返回2。所以应用窗口的默认主序为2x10000+1000=21000，而壁纸窗口为1x10000+1000=11000。
+
+再看计算子序
+
+```java
+int APPLICATION_MEDIA_SUBLAYER = -2;
+int APPLICATION_MEDIA_OVERLAY_SUBLAYER = -1;
+int APPLICATION_PANEL_SUBLAYER = 1;
+int APPLICATION_SUB_PANEL_SUBLAYER = 2;
+int APPLICATION_ABOVE_SUB_PANEL_SUBLAYER = 3;
+default int getSubWindowLayerFromTypeLw(int type) {
+    switch (type) {
+        case TYPE_APPLICATION_PANEL:
+        case TYPE_APPLICATION_ATTACHED_DIALOG:
+            return APPLICATION_PANEL_SUBLAYER;
+        case TYPE_APPLICATION_MEDIA:
+            return APPLICATION_MEDIA_SUBLAYER;
+        case TYPE_APPLICATION_MEDIA_OVERLAY:
+            return APPLICATION_MEDIA_OVERLAY_SUBLAYER;
+        case TYPE_APPLICATION_SUB_PANEL:
+            return APPLICATION_SUB_PANEL_SUBLAYER;
+        case TYPE_APPLICATION_ABOVE_SUB_PANEL:
+            return APPLICATION_ABOVE_SUB_PANEL_SUBLAYER;
+    }
+    Slog.e("WindowManager", "Unknown sub-window type: " + type);
+    return 0;
+}
+```
+
+判断是子窗口类型的话，返回-2到3之间的值，其实就是相对于父窗口的位置，在其前或者后几位。
+
+```java
+//以下是dumpsys window后看到的窗口信息
+//状态栏
+Window #1 Window{3ce83ce u0 StatusBar}:
+mBaseLayer=151000 mSubLayer=0    mToken=WindowToken{3cdc0c9 type=2000 android.os.BinderProxy@a60d182}
+//...
+
+//Demo的activity窗口弹出的PopupWindow
+Window #6 Window{c24c4aa u0 PopupWindow:9c5a292}:
+mBaseLayer=21000 mSubLayer=1    mToken=ActivityRecord{f7f4f25 u0 com.paul.test/.SecondActivity} t89}
+mActivityRecord=ActivityRecord{f7f4f25 u0 com.paul.test/.SecondActivity} t89}
+//...
+
+//Demo的Activity窗口
+Window #7 Window{ba4aa87 u0 com.paul.test/com.paul.test.SecondActivity}:
+mBaseLayer=21000 mSubLayer=0    mToken=ActivityRecord{f7f4f25 u0 com.paul.test/.SecondActivity} t89}
+mActivityRecord=ActivityRecord{f7f4f25 u0 com.paul.test/.SecondActivity} t89}
+//...
+
+//壁纸窗口
+Window #12 Window{43d8bee u0 com.android.systemui.wallpapers.ImageWallpaper}:
+mBaseLayer=11000 mSubLayer=0    mToken=WallpaperWindowToken{8556705 token=android.os.Binder@457e27c}
+//...
+
+```
+
+可以看到状态栏在最上面，activity的popupwindow作为子窗口在activity的上面，壁纸在最底部。  
+
+上面这些概念理解通的话，WMS管理窗口的原理基本上就理解了一大部分了，下面把漏掉的细节补上。
+
+#### WMS启动流程
+
+在[开机流程](https://github.com/beyond667/study/blob/master/note/%E5%BC%80%E6%9C%BA%E6%B5%81%E7%A8%8B.md)中已经分析过，WMS是在`SystemServer`的`startOtherServices()`里启动的，本文只关注跟WMS相关的。
+
+```java
+private void startOtherServices(@NonNull TimingsTraceAndSlog t) {
+    //...
+    //通过wms.main方法初始化WMS
+    wm = WindowManagerService.main(context, inputManager, !mFirstBoot, mOnlyCore,
+                                   new PhoneWindowManager(), mActivityManagerService.mActivityTaskManager);
+    //AMS里关联此WMS
+    mActivityManagerService.setWindowManager(wm);
+    //执行wms.onInitReady通知初始化完成
+    wm.onInitReady();
+    //...
+    //wms已经完全启动好，把关联的服务也执行其systemReady
+    wm.systemReady();
+    //...
+}
+```
+
+wms通过执行其main方法实现初始化，再关联到ams中，之后在调用其onInitReady通知初始化已完成。  
+
+这里注意传的参数里有个new PhoneWindowManager()
+
+```java
+//wms.java
+public static WindowManagerService main(final Context context, final InputManagerService im,
+                                        final boolean showBootMsgs, final boolean onlyCore, WindowManagerPolicy policy,
+                                        ActivityTaskManagerService atm) {
+    return main(context...SurfaceControl.Transaction::new, SurfaceControl.Builder::new);
+}
+public static WindowManagerService main(...) {
+    final WindowManagerService[] wms = new WindowManagerService[1];
+    //Display线程运行new WindowManagerService
+    DisplayThread.getHandler().runWithScissors(() ->
+                                               wms[0] = new WindowManagerService(context...),0);
+    return wms[0];
+}
+```
+
+main方法里通过runWithScissors往display线程发送消息，并等待display线程执行完此消息后再继续往下走。
+
+> runWithScissors方法会在当前线程new一个BlockingRunnable，并执行其postAndWait，在这里会先往目标线程的hander post要执行的runnable，之后本线程wait等待，直到目标线程执行完此runnable，并唤醒调用线程，调用线程才继续往下执行。代码不再细看。
+
+```java
+private WindowManagerService(Context context, InputManagerService inputManager...){
+	//...
+    //参数本地化
+    mInputManager = inputManager; 
+    //SurfaceControl工厂
+    mSurfaceControlFactory = surfaceControlFactory;
+    //mPolicy即new PhoneWindowManager()
+    mPolicy = policy;
+    //管理所有的窗口动画
+    mAnimator = new WindowAnimator(this);
+    //所有窗口的根容器
+    mRoot = new RootWindowContainer(this);
+    
+    mDisplayManager = (DisplayManager)context.getSystemService(Context.DISPLAY_SERVICE);
+    //...
+}
+public void onInitReady() {
+    initPolicy();
+    //添加看门狗监控WMS
+    Watchdog.getInstance().addMonitor(this);
+}
+private void initPolicy() {
+    UiThread.getHandler().runWithScissors(new Runnable() {
+        @Override
+        public void run() {
+            WindowManagerPolicyThread.set(Thread.currentThread(), Looper.myLooper());
+            //1 执行PhoneWindowManager.init，以完成PhoneWindowManager的初始化
+            mPolicy.init(mContext, WindowManagerService.this);
+        }
+    }, 0);
+}
+
+public void systemReady() {
+    //关联的服务也执行其systemReady
+    mSystemReady = true;
+    mPolicy.systemReady();
+    mRoot.forAllDisplayPolicies(DisplayPolicy::systemReady);
+    mTaskSnapshotController.systemReady();
+    //...
+}
+```
+
+这里注意下注释1处，在wms.onInitReady里执行了initPolicy，这里跟上面一样，往UI线程post一条消息，来完成mPolicy的初始化，即PhoneWindowManager的初始化。在wms启动好后执行systemReady时，也同样执行了mPolicy的systemReady。另在wms.onInitReady里添加了看门狗来监控WMS的运行，可参照[深入理解WatchDog](https://github.com/beyond667/study/blob/master/note/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3WatchDog%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86.md)
+
+##### WMS管理窗口
+

@@ -4,7 +4,7 @@ PMS是android系统很重要的一个系统服务，主要负责管理应用的�
 
 #### PMS启动流程
 
-在[开机流程](https://github.com/beyond667/study/blob/master/note/Activity%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md)中已经分析过，PMS是在`SystemServer`的`startBootstrapServices()`里启动的，本文只关注跟PMS相关的。
+在[开机流程](https://github.com/beyond667/study/blob/master/note/%E5%BC%80%E6%9C%BA%E6%B5%81%E7%A8%8B.md)中已经分析过，PMS是在`SystemServer`的`startBootstrapServices()`里启动的，本文只关注跟PMS相关的。
 
 > frameworks/base/services/java/com/android/server/SystemServer.java
 
