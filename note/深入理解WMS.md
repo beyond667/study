@@ -1021,3 +1021,103 @@ public void systemReady() {
 
 ##### WMS管理窗口
 
+从客户端角度，不管是Activity，dialog，还是popupWindow等自定义的view，在显示前都会调用WindowManagerImpl.addView（可能会先设置窗口类型大小位置等参数），这里会调用全局单例类WindowManagerGlobal.addView，此方法会先把窗口参数缓存到params里，再构建个ViewRootImpl对象，再把params，viewrootImpl和decorView都缓存起来，最后调用viewRootImpl.setView，此方法会先调用requestLayout先完成一次View绘制，此时view还没添加到窗口，然后通过session.addToDisplayAsUser调用服务端的session去完成窗口添加。
+
+从服务端角度来看，客户端调用Session.addToDisplayAsUser,其实也就是调用wms.addWindow（此方法就这一行代码），我们再从完整的角度看下wms.addWindow
+
+```java
+//wms.java
+public int addWindow(Session session, IWindow client, LayoutParams attrs...){
+    //1 先检查要添加的窗口的应用是否有权限
+    int res = mPolicy.checkAddPermission(attrs.type, isRoundedCornerOverlay, attrs.packageName,appOp);
+    if (res != ADD_OKAY) {
+        return res;
+    }
+
+    WindowState parentWindow = null;
+    final int type = attrs.type;
+
+    //2 校验DisplayContent，开机启动时已经new了DisplayContent后添加到RootWindowContainer
+    final DisplayContent displayContent = getDisplayContentOrCreate(displayId, attrs.token);
+    if (displayContent == null) {
+        return WindowManagerGlobal.ADD_INVALID_DISPLAY;
+    }
+
+    //3 已经添加过此窗口的话就不再添加直接return
+    if (mWindowMap.containsKey(client.asBinder())) {
+        return WindowManagerGlobal.ADD_DUPLICATE_ADD;
+    }
+    
+    //4 如果要添加的窗口是子窗口，需校验其父窗口，如果为空或者父窗口的类型也是子窗口，也直接返回校验失败
+    if (type >= FIRST_SUB_WINDOW && type <= LAST_SUB_WINDOW) {
+        parentWindow = windowForClientLocked(null, attrs.token, false);
+        if (parentWindow == null) {
+            return WindowManagerGlobal.ADD_BAD_SUBWINDOW_TOKEN;
+        }
+        if (parentWindow.mAttrs.type >= FIRST_SUB_WINDOW
+            && parentWindow.mAttrs.type <= LAST_SUB_WINDOW) {
+            return WindowManagerGlobal.ADD_BAD_SUBWINDOW_TOKEN;
+        }
+    }
+    //...省略其他type的校验
+    
+    //5 WindowToken校验，这步后一定会有windowToken
+    ActivityRecord activity = null;
+    final boolean hasParent = parentWindow != null;
+    WindowToken token = displayContent.getWindowToken(hasParent ? parentWindow.mAttrs.token : attrs.token);
+    if (token == null) {
+        //...
+    }else if(rootType >= FIRST_APPLICATION_WINDOW&& rootType <= LAST_APPLICATION_WINDOW){
+        //...
+    }//...
+    
+    //6 构建WindowState
+    final WindowState win = new WindowState(this, session, client, token, parentWindow,
+                                            appOp[0], attrs, viewVisibility, session.mUid, userId,
+                                            session.mCanAddInternalSystemWindow);
+
+    //...
+    res = ADD_OKAY;
+    //7 如果应用是冷启动，会在native层创建SurfaceSession
+    win.attach();
+    //缓存该Windowstate
+    mWindowMap.put(client.asBinder(), win);
+    //...
+    win.mToken.addWindow(win);
+    displayPolicy.addWindowLw(win, attrs);
+
+    return res;
+}
+```
+
++ 注释1-4都是校验过程，不再细看。
++ 注释5关于WindowToken的校验，可以参照上面WindowToken部分
++ 注释6关于WindowState的创建，可以参照上面WindowState部分
++ 注释7调用windowState.attach，如果该应用是冷启动，会创建SurfaceSession。关于SurfaceFlinger部分会专门详解。
+
+关于移除Window，在activity销毁，dialog或者popupwindow隐藏等都会调用流程如下（这里只关注WMS，不关注客户端方面）：
+
+Session.remove -> wms.removeWindow -> WindowState.removeIfPossible-> removeImmediately->postWindowRemoveCleanupLocked.postWindowRemoveCleanupLocked 
+
+```java
+void postWindowRemoveCleanupLocked(WindowState win) {
+    //wms移除WindowState记录
+    mWindowMap.remove(win.mClient.asBinder());
+    //移除WindowToken
+    final WindowToken token = win.mToken;
+    if (token.isEmpty() && !token.mPersistOnEmpty) {
+        token.removeImmediately();
+    }
+}
+```
+
+综上WMS主要是为了维护WindowState对象。  
+
+#### 总结
+
+添加窗口的过程可以从客户端和服务端两端分别分析。
+
+对客户端来说，不管是启动activity还是打开dialog或者popupwindow，都会设置其窗口类型，比如Avtivity是1，dialog用的是PhoneWindow的默认是2，popupwindow作为子窗口默认是1000，再调用WindowManagerImpl.addView ->WindowManagerGlobal.addView，WindowManagerGlobal是客户端的单例类，管理客户端该应用所有的窗口，这里会先把PhoneWindow里的参数取出放到WindowManager.LayoutParams，再构建个ViewRootImpl，可以理解成一个activity对应一个ViewRootImpl，再在WindowManagerGlobal里缓存ViewRootImpl，decorView，LayoutParams这3个对象，方便后面管理。最终调用ViewRootImpl.setView->Session.addToDisplayAsUser，这里会传窗口的参数params和ViewRootImpl的内部binder对象IWindow.Stub，此binder对象持有外部类ViewRootImpl的弱引用，方便服务端来控制客户端的此ViewRootImpl即Activity或者dialog的窗口。  另外注意一个应用只有一个Session，只有应用第一次启动时才会去服务端拿Session的代理。
+
+对服务端来说，session.addToDisplayAsUser直接调用wms.addWindow，会先做些校验工作，比如该应用是否有添加窗口的权限，如果添加的是子窗口，父窗口不能为空或者也是子窗口等。之后会去校验WindowToken，系统应用可以不用传WindowToken，不传的话会为其自动生成WindowToken，普通应用必须传WindowToken。WindowToken可以理解成一个装WindowState的容器，在其构造方法中传了token作为凭证，对普通应用来说，在其启动流程startActivityUnchecked中最终会调用到DisplayContent.addWindowToken去添加binder和WindowToken的绑定关系，普通应用这里的WindowToken实际上是ActivityRecord，其继承于WindowToken。wms.addWindow这里会通过binder来拿WindowToken进行校验。之后根据WindowState，session，IWindow等创建WindowState，代表了WMS端一个真正的窗口，WMS实际就是维护此对象，比如添加，删除更新，焦点，事件传递等。在第一次启动应用时会在WindowState.attach里去创建SurfaceSession，具体的绘制就是通过此SurfaceSession关联的SurfaceFlinger来做的。
+
