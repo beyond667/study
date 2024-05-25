@@ -10,7 +10,7 @@
 Framework <img width=600/>|
 ---|
 [PMS启动流程](https://github.com/beyond667/study/blob/master/note/PMS%E5%90%AF%E5%8A%A8%E6%B5%81%E7%A8%8B.md) 
-[深入理解WMS](https://github.com/beyond667/study/blob/master/note/%E7%BC%96%E8%AF%91Aosp.md) 
+[深入理解WMS](https://github.com/beyond667/study/blob/master/note/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3WMS.md) 
 [（X）深入理解SurfaceFlinger](https://github.com/beyond667/study/blob/master/note/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3SurfaceFlinger.md) 
 [installd守护进程](https://github.com/beyond667/study/blob/master/note/installd%E5%AE%88%E6%8A%A4%E8%BF%9B%E7%A8%8B.md) 
 [（X）深入理解Binder原理](https://github.com/beyond667/study/blob/master/note/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3Binder%E5%8E%9F%E7%90%86.md) 
