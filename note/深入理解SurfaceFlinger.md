@@ -103,12 +103,17 @@ static char const* getServiceName() ANDROID_API { return "SurfaceFlinger"; }
 
 我们主要看注释1 `surfaceflinger::createSurfaceFlinger`这里的surfaceflinger其实指的是SurfaceFlingerFactory
 
-> frameworks/native/services/surfaceflinger/SurfaceFlingerFactory.h
-
 ```c++
+//SurfaceFlingerFactory.h
 namespace surfaceflinger {
 //...
     ANDROID_API sp<SurfaceFlinger> createSurfaceFlinger();
+}
+
+//SurfaceFlingerFactory.cpp
+sp<SurfaceFlinger> createSurfaceFlinger() {
+    static DefaultFactory factory;
+    return new SurfaceFlinger(factory);
 }
 ```
 
