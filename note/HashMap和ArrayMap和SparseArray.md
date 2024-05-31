@@ -516,7 +516,7 @@ public V removeAt(int index) {
         nsize = 0;
     } else {
         nsize = osize - 1;
-        //1 数组长度大于8并且已用的小于3分之一，进行缩容操作。缩小到原size的2/3
+        //1 数组长度大于8并且已用的小于3分之一，进行缩容操作。缩小到已用size的1.5
         // 假如现在数组长度18，已用的5个，缩容后为8
         // 假如现在数组长度是40，已用12个，缩容后为18
         if (mHashes.length > (BASE_SIZE*2) && mSize < mHashes.length/3) {
