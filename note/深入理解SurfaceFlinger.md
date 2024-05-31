@@ -101,7 +101,7 @@ static char const* getServiceName() ANDROID_API { return "SurfaceFlinger"; }
 + 注释2发布名为SurfaceFlinger的系统服务，后面还发布了名为SurfaceFlingerAIDL的系统服务
 + 注释3调用其run方法，进入休眠
 
-我们主要看注释1 `surfaceflinger::createSurfaceFlinger`这里的surfaceflinger其实指的是SurfaceFlingerFactory
+我们先看注释1 `surfaceflinger::createSurfaceFlinger`这里的surfaceflinger其实指的是SurfaceFlingerFactory
 
 ```c++
 //SurfaceFlingerFactory.h
@@ -114,6 +114,240 @@ namespace surfaceflinger {
 sp<SurfaceFlinger> createSurfaceFlinger() {
     static DefaultFactory factory;
     return new SurfaceFlinger(factory);
+}
+```
+
+调用SurfaceFlinger的构造函数来实例化对象
+
+>frameworks/native/services/surfaceflinger/surfaceflinger.cpp
+
+```cpp
+SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipInitialization) {
+    // 一些参数的初始化
+    //...
+}
+
+SurfaceFlinger::SurfaceFlinger(Factory& factory, SkipInitializationTag)
+      : mFactory(factory),
+        mPid(getpid()),
+        mInterceptor(mFactory.createSurfaceInterceptor()),
+        mTimeStats(std::make_shared<impl::TimeStats>()),
+        mFrameTracer(mFactory.createFrameTracer()),
+        mFrameTimeline(mFactory.createFrameTimeline(mTimeStats, mPid)),
+		//关注下这个mCompositionEngine的初始化
+        mCompositionEngine(mFactory.createCompositionEngine()),
+        mHwcServiceName(base::GetProperty("debug.sf.hwc_service_name"s, "default"s)),
+        mTunnelModeEnabledReporter(new TunnelModeEnabledReporter()),
+        mInternalDisplayDensity(getDensityFromProperty("ro.sf.lcd_density", true)),
+        mEmulatedDisplayDensity(getDensityFromProperty("qemu.sf.lcd_density", false)),
+        mPowerAdvisor(std::make_unique<Hwc2::impl::PowerAdvisor>(*this)),
+        mWindowInfosListenerInvoker(sp<WindowInfosListenerInvoker>::make(*this)) {
+}
+```
+
+构造函数里的其他参数初始化不再细看，主要看下mCompositionEngine（Composition译为作品，构图，组合等）的初始化。
+
+> frameworks/native/services/surfaceflinger/SurfaceFlingerDefaultFactory.cpp 
+
+```cpp
+std::unique_ptr<compositionengine::CompositionEngine> DefaultFactory::createCompositionEngine() {
+    return compositionengine::impl::createCompositionEngine();
+}
+//创建HWComposer，后面init方法有用到
+std::unique_ptr<HWComposer> DefaultFactory::createHWComposer(const std::string& serviceName) {
+    return std::make_unique<android::impl::HWComposer>(serviceName);
+}
+
+//frameworks/native/services/surfaceflinger/CompositionEngine/src/CompositionEngine.cpp
+std::unique_ptr<compositionengine::CompositionEngine> createCompositionEngine() {
+    return std::make_unique<CompositionEngine>();
+}
+```
+
+> make_unique是C++14引入的一个函数模板,用于创建并返回一个指向动态分配对象的unique_ptr智能指针。它是为了简化代码,避免手动使用new和delete,以及确保资源的正确释放而设计的。其实就是创建并返回了个指定对象的智能指针。
+
+继续看注释1处`flinger->init()`执行了SurfaceFlinger的init方法
+
+```cpp
+void SurfaceFlinger::init() {
+    //...
+    //基于build模式创建RenderEngine对象，再把其设置到mCompositionEngine里
+    auto builder = renderengine::RenderEngineCreationArgs::Builder()
+        .setPixelFormat(static_cast<int32_t>(defaultCompositionPixelFormat))
+        .setImageCacheSize(maxFrameBufferAcquiredBuffers)
+        .setUseColorManagerment(useColorManagement)
+        .setEnableProtectedContext(enable_protected_contents(false))
+        .setPrecacheToneMapperShaderOnly(false)
+        .setSupportsBackgroundBlur(mSupportsBlur)
+        .setContextPriority(
+        useContextPriority
+        ? renderengine::RenderEngine::ContextPriority::REALTIME
+        : renderengine::RenderEngine::ContextPriority::MEDIUM);
+    mCompositionEngine->setRenderEngine(renderengine::RenderEngine::create(builder.build()));
+    
+    mCompositionEngine->setTimeStats(mTimeStats);
+	//创建HWComposer对象，再把其设置到mCompositionEngine里
+    mCompositionEngine->setHwComposer(getFactory().createHWComposer(mHwcServiceName));
+    mCompositionEngine->getHwComposer().setCallback(*this);
+    
+    //4 处理热插拔和显示更改的事件
+    processDisplayHotplugEventsLocked();
+    
+    //初始化display
+    initializeDisplays();
+    
+}
+```
+
+里面会先对CompositionEngine设置RenderEngine和HwComposer，再看注释4处`processDisplayHotplugEventsLocked`方法
+
+```c++
+void SurfaceFlinger::processDisplayHotplugEventsLocked() {
+    for (const auto& event : mPendingHotplugEvents) {
+        std::optional<DisplayIdentificationInfo> info =
+            getHwComposer().onHotplug(event.hwcDisplayId, event.connection);
+        //...
+        processDisplayChangesLocked();
+    }
+}
+
+void SurfaceFlinger::processDisplayChangesLocked() {
+    //...
+    for (size_t i = 0; i < draw.size(); i++) {
+        const ssize_t j = curr.indexOfKey(displayToken);
+        if (j < 0) {
+            //处理display移除事件
+            processDisplayRemoved(displayToken);
+        }else {
+            //处理display更新事件
+            const DisplayDeviceState& currentState = curr[j];
+            const DisplayDeviceState& drawingState = draw[i];
+            processDisplayChanged(displayToken, currentState, drawingState);
+        }
+    }
+    for (size_t i = 0; i < curr.size(); i++) {
+        const wp<IBinder>& displayToken = curr.keyAt(i);
+        if (draw.indexOfKey(displayToken) < 0) {
+            //处理display添加事件
+            processDisplayAdded(displayToken, curr[i]);
+        }
+    }
+}
+
+void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
+                                         const DisplayDeviceState& state) {
+    //...
+    if (display->isPrimary()) {
+        //5 进行Scheduler初始化
+        initScheduler(display);
+    }
+}
+```
+
+注释5处执行initScheduler初始化Scheduler
+
+```c++
+void SurfaceFlinger::initScheduler(const sp<DisplayDevice>& display) {
+    //如果初始化过就直接return
+    if (mScheduler) {
+        mScheduler->setRefreshRateConfigs(display->holdRefreshRateConfigs());
+        return;
+    }
+	//获取当前屏幕的fps 刷新率即帧率
+    const auto currRefreshRate = display->getActiveMode()->getFps();
+    mRefreshRateStats = std::make_unique<scheduler::RefreshRateStats>(*mTimeStats, currRefreshRate,
+                                                                      hal::PowerMode::OFF);
+	//基于帧率创建vsync配置
+    mVsyncConfiguration = getFactory().createVsyncConfiguration(currRefreshRate);
+    mVsyncModulator = sp<VsyncModulator>::make(mVsyncConfiguration->getCurrentConfigs());
+    
+	//6 生成scheduler
+    mScheduler = std::make_unique<scheduler::Scheduler>(static_cast<ICompositor&>(*this),
+                                                        static_cast<ISchedulerCallback&>(*this),features);
+    //...
+    //7 创建app和appSf的连接
+    mAppConnectionHandle =
+        mScheduler->createConnection("app", mFrameTimeline->getTokenManager(),
+                                     /*workDuration=*/configs.late.appWorkDuration,
+                                     /*readyDuration=*/configs.late.sfWorkDuration,
+                                     impl::EventThread::InterceptVSyncsCallback());
+    mSfConnectionHandle =
+        mScheduler->createConnection("appSf", mFrameTimeline->getTokenManager(),
+                                     /*workDuration=*/std::chrono::nanoseconds(vsyncPeriod),
+                                     /*readyDuration=*/configs.late.sfWorkDuration,
+                                     [this](nsecs_t timestamp) {
+                                         mInterceptor->saveVSyncEvent(timestamp);
+                                     });
+    //初始化vsync
+    mScheduler->initVsync(mScheduler->getVsyncDispatch(), *mFrameTimeline->getTokenManager(),
+                          configs.late.sfWorkDuration);
+    
+    //...
+}
+```
+
+重点看注释7分别创建app和appSf连接
+
+>frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp
+
+```c++
+ConnectionHandle Scheduler::createConnection(
+    const char* connectionName, frametimeline::TokenManager* tokenManager,
+    std::chrono::nanoseconds workDuration, std::chrono::nanoseconds readyDuration,
+    impl::EventThread::InterceptVSyncsCallback interceptCallback) {
+    //8 创建DispSyncSource
+    auto vsyncSource = makePrimaryDispSyncSource(connectionName, workDuration, readyDuration);
+    auto throttleVsync = makeThrottleVsyncCallback();
+    auto getVsyncPeriod = makeGetVsyncPeriodFunction();
+    //9 基于DispSyncSource创建EventThread线程
+    auto eventThread = std::make_unique<impl::EventThread>(std::move(vsyncSource), tokenManager,
+                                                           std::move(interceptCallback),
+                                                           std::move(throttleVsync),
+                                                           std::move(getVsyncPeriod));
+    //strcmp判断两个字符串是否相等，相等的话返回0，这里如果传的是app，strcmp即0，前面取非即1
+    //也就是说如果是app，这个triggerRefresh为true
+    bool triggerRefresh = !strcmp(connectionName, "app");
+    return createConnection(std::move(eventThread), triggerRefresh);
+}
+
+ConnectionHandle Scheduler::createConnection(std::unique_ptr<EventThread> eventThread,
+                                             bool triggerRefresh) {
+    //10 创建ConnectionHandle
+    const ConnectionHandle handle = ConnectionHandle{mNextConnectionHandleId++};
+    //11 创建EventThreadConnection
+    auto connection = createConnectionInternal(eventThread.get(), triggerRefresh);
+
+    std::lock_guard<std::mutex> lock(mConnectionsLock);
+    //12 往mConnections缓存ConnectionHandle和Connection
+    //其中Connection里包含了EventThreadConnection和eventThread
+    mConnections.emplace(handle, Connection{connection, std::move(eventThread)});
+    return handle;
+}
+
+sp<EventThreadConnection> Scheduler::createConnectionInternal(EventThread* eventThread,
+                                                              bool triggerRefresh, ISurfaceComposer::EventRegistrationFlags eventRegistration) {
+    // Refresh need to be triggered from app thread alone.
+    // Triggering it from sf connection can result in infinite loop due to requestnextvsync.
+    //上面英文注释说明，刷新操作只能从app线程触发，如果从sf线程触发，会由于requestnextvsync导致无限循环
+    if (triggerRefresh) {
+        return eventThread->createEventConnection([&] { resyncAndRefresh(); }, eventRegistration);
+    } else {
+        return eventThread->createEventConnection([&] { resync(); }, eventRegistration);
+    }
+}
+```
+
+
+
+
+
+```cpp
+std::unique_ptr<VSyncSource> Scheduler::makePrimaryDispSyncSource(
+    const char* name, std::chrono::nanoseconds workDuration,
+    std::chrono::nanoseconds readyDuration, bool traceVsync) {
+    return std::make_unique<scheduler::DispSyncSource>(mVsyncSchedule->getDispatch(),
+                                                       mVsyncSchedule->getTracker(), workDuration,
+                                                       readyDuration, traceVsync, name);
 }
 ```
 
