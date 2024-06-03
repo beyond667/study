@@ -337,17 +337,11 @@ sp<EventThreadConnection> Scheduler::createConnectionInternal(EventThread* event
 }
 ```
 
++ 注释8和9会创建指定的EventThread线程，这里会创建app和appSf
++ 注释10会创建ConnectionHandle
++ 注释11基于9处创建的EventThread来创建EventThreadConnection
++ 注释12以ConnectionHandle作为key，EventThreadConnection作为value缓存到mConnections里
 
-
-
-
-```cpp
-std::unique_ptr<VSyncSource> Scheduler::makePrimaryDispSyncSource(
-    const char* name, std::chrono::nanoseconds workDuration,
-    std::chrono::nanoseconds readyDuration, bool traceVsync) {
-    return std::make_unique<scheduler::DispSyncSource>(mVsyncSchedule->getDispatch(),
-                                                       mVsyncSchedule->getTracker(), workDuration,
-                                                       readyDuration, traceVsync, name);
-}
-```
-
+> app线程负责接收vsync信号并且上报给app，app开始画图，即渲染
+>
+> sf线程用于接收vsync信号用于合成
