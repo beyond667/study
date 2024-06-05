@@ -196,6 +196,12 @@ void SurfaceFlinger::init() {
     //初始化display
     initializeDisplays();
     
+    //创建开机动画线程并执行开机动画过程
+    mStartPropertySetThread = getFactory().createStartPropertySetThread(presentFenceReliable);
+
+    if (mStartPropertySetThread->Start() != NO_ERROR) {
+        ALOGE("Run StartPropertySetThread failed!");
+    }
 }
 ```
 
@@ -342,6 +348,87 @@ sp<EventThreadConnection> Scheduler::createConnectionInternal(EventThread* event
 + 注释11基于9处创建的EventThread来创建EventThreadConnection
 + 注释12以ConnectionHandle作为key，EventThreadConnection作为value缓存到mConnections里
 
-> app线程负责接收vsync信号并且上报给app，app开始画图，即渲染
+> app线程负责接收vsync信号并且上报给app，app开始画图，即负责通知app渲染
 >
-> sf线程用于接收vsync信号用于合成
+> sf线程用于接收vsync信号用于合成。
+>
+> 两个线程同时收到vsync信号，如果同时工作的话第一个线程还没渲染完第二个线程就没办法合成，所以这里会对这两个线程配置不同的时间偏移量，保证第一个线程执行完后再执行第二个。
+
+注意一点的是，Android12之前偏移量在createConnection时就会传进来
+
+```cpp
+//Android11的surfaceflinger.cpp
+void SurfaceFlinger::init() {
+    //...
+    mAppConnectionHandle =
+        mScheduler->createConnection("app", mPhaseConfiguration->getCurrentOffsets().late.app,
+                                     impl::EventThread::InterceptVSyncsCallback());
+    mSfConnectionHandle =
+        mScheduler->createConnection("sf", mPhaseConfiguration->getCurrentOffsets().late.sf,
+                                     [this](nsecs_t timestamp) {
+                                         mInterceptor->saveVSyncEvent(timestamp);
+                                     });
+    //...
+}
+```
+
+可以看到11在SurfaceFlinger的init里就直接createConnection，并且createConnection传了offsets，而Android12即以后createConnection放到了initScheduler里，并且偏移量也不是直接传进去的
+
+```c++
+//Android13的surfaceflinger.cpp
+void SurfaceFlinger::init() {
+    //...
+    startUnifiedDraw();
+}
+void SurfaceFlinger::startUnifiedDraw() {
+  createPhaseOffsetExtn();
+}
+
+void SurfaceFlinger::createPhaseOffsetExtn() {
+    //...
+    const auto vsyncConfig =
+        mVsyncModulator->setVsyncConfigSet(mVsyncConfiguration->getCurrentConfigs());
+    ALOGI("VsyncConfig sfOffset %" PRId64 "\n", vsyncConfig.sfOffset);
+    ALOGI("VsyncConfig appOffset %" PRId64 "\n", vsyncConfig.appOffset);  
+}
+  
+```
+
+最上面注释1处的init过程就看完了，surfaceflinger初始化时会创建两个eventthread线程：app和appsf，分别用来接收vsync后通知app完成绘制和sf来完成合成，两个线程基于不同的偏移量，保证app线程执行完渲染后再由appsf线程完成合成。
+
+注释2处是把surfaceflinger发布到ServiceManager，绑定时会回调surfaceflinger的binderDied方法
+
+```cpp
+void SurfaceFlinger::binderDied(const wp<IBinder>&) {
+    // the window manager died on us. prepare its eulogy.
+    mBootFinished = false;
+
+    // Sever the link to inputflinger since it's gone as well.
+    static_cast<void>(mScheduler->schedule([=] { mInputFlinger = nullptr; }));
+
+    // restore initial conditions (default device unblank, etc)
+    initializeDisplays();
+
+    // restart the boot-animation
+    startBootAnim();
+}
+```
+
+如果绑定到ServerManager的surfaceflinger服务挂掉的话，这里会重新执行开机动画。
+
+注释3会调用run方法，进入休眠
+
+```c++
+//SurfaceFlinger.cpp
+void SurfaceFlinger::run() {
+    mScheduler->run();
+}
+
+//Scheduler.cpp
+void Scheduler::run() {
+    while (true) {
+        waitMessage();
+    }
+}
+```
+
