@@ -205,7 +205,7 @@ void SurfaceFlinger::init() {
 }
 ```
 
-里面会先对CompositionEngine设置RenderEngine和HwComposer，再看注释4处`processDisplayHotplugEventsLocked`方法
+里面会先对CompositionEngine设置RenderEngine和HwComposer（通过HAL层的HWComposer硬件模块或者软件模拟产生Vsync信号），再看注释4处`processDisplayHotplugEventsLocked`方法
 
 ```c++
 void SurfaceFlinger::processDisplayHotplugEventsLocked() {
@@ -343,7 +343,7 @@ sp<EventThreadConnection> Scheduler::createConnectionInternal(EventThread* event
 }
 ```
 
-+ 注释8和9会创建指定的EventThread线程，这里会创建app和appSf
++ 注释8和9会创建DispSyncSource，并根据DispSyncSource创建EventThread线程，这里会创建app和appSf
 + 注释10会创建ConnectionHandle
 + 注释11基于9处创建的EventThread来创建EventThreadConnection
 + 注释12以ConnectionHandle作为key，EventThreadConnection作为value缓存到mConnections里
@@ -431,4 +431,212 @@ void Scheduler::run() {
     }
 }
 ```
+
+Android12之后Scheduler就是继承于MessageQueue，所以这里调用的是MessageQueue的waitMessage
+
+```c++
+//Scheduler.h
+class Scheduler : impl::MessageQueue {
+    using Impl = impl::MessageQueue;
+}   
+//MessageQueue.java
+void MessageQueue::waitMessage() {
+    do {
+        IPCThreadState::self()->flushCommands();
+        int32_t ret = mLooper->pollOnce(-1);
+        switch (ret) {
+            case Looper::POLL_WAKE:
+            case Looper::POLL_CALLBACK:
+                continue;
+            case Looper::POLL_ERROR:
+                ALOGE("Looper::POLL_ERROR");
+                continue;
+            case Looper::POLL_TIMEOUT:
+                // timeout (should not happen)
+                continue;
+            default:
+                // should not happen
+                ALOGE("Looper::pollOnce() returned unknown status %d", ret);
+                continue;
+        }
+    } while (true);
+} 
+```
+
+可以看到SurfaceFlinger的主线程通过死循环执行waitMessage，而其内部是通过mLooper->pollOnce去获取消息。这块的Looper，MessageQueue和java层的不是同一个对象，此处的Looper和MQ是专门为SurfaceFlinger设计的。  
+
+到这里先总结下，SurfaceFlinger启动过程是从SurfaceFlinger.rc配置执行了main_surfaceflinger.cpp的main方法，这里会先创建SurfaceFlinger对象并执行其init方法，这里会初始化scheduler，在scheduler初始化时会创建两个EventThread线程：app，appsf线程，接收到vsync信号后app线程通知客户端执行绘制流程，然后appsf线程在一段时间后执行合成流程。初始化完之后surfaceflinger会在主线程执行waitMessage等待消息，内部是通过Looper.poolOnce去获取消息。  
+
+#### SurfaceFlinger工作流程
+
+> 启动过程有几个比较重要的对象没有细看，比如，DispSyncSource，HWComposer，在SurfaceFlinger工作流程中将会再关注到这几个对象。
+
+我们分析下从应用启动流程到屏幕显示出画面的过程。
+
+##### 1 与SurfaceFlinger创建连接
+
+先复习下，在[深入理解WMS](https://github.com/beyond667/study/blob/master/note/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3WMS.md)一节的Session中可知，ActivityThread.handleResumeActivity -> WindowManagerImpl.addView -> WindowManagerGlobal.addView -> new ViewRootImpl ->WindowManagerGlobal.getWindowSession()，应用初始化ViewRootImpl时会去获取Session，而Session在应用中是单例存在的，即一个应用只有一个Session。
+
+```java
+public static IWindowSession getWindowSession() {
+    synchronized (WindowManagerGlobal.class) {
+        if (sWindowSession == null) {
+            IWindowManager windowManager = getWindowManagerService();
+            sWindowSession = windowManager.openSession(
+                new IWindowSessionCallback.Stub() {
+                    @Override
+                    public void onAnimatorScaleChanged(float scale) {
+                        ValueAnimator.setDurationScale(scale);
+                    }
+                });
+
+        }
+        return sWindowSession;
+    }
+}
+```
+
+可以看到第一次获取Session会调用WMS.openSession去获取Session，然后缓存到当前进程。
+
+> frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+
+```java
+public IWindowSession openSession(IWindowSessionCallback callback) {
+    //Session肯定是个Binder对象，要把其代理对象返回给客户端
+    return new Session(this, callback);
+}
+//Session.java
+class Session extends IWindowSession.Stub implements IBinder.DeathRecipient {}
+```
+
+然后在viewRootImpl.setView -> session.addToDisplayAsUser -> wms.addWindow，wms会创建WindowState，并执行其attach
+
+```java
+public int addWindow(Session session, IWindow client, LayoutParams attrs...){
+    //...
+    final WindowState win = new WindowState(this,session...);
+    win.attach();
+    //...
+}
+void attach() {
+    mSession.windowAddedLocked();
+}
+
+//Session.java
+private int mNumWindow = 0;
+void windowAddedLocked() {
+    //从这里可以看到只有应用第一次添加窗口时才会创建一次SurfaceSession
+    if (mSurfaceSession == null) {
+        //11 这里会创建SurfaceSession
+        mSurfaceSession = new SurfaceSession();
+        mService.mSessions.add(this);
+        if (mLastReportedAnimatorScale != mService.getCurrentAnimatorScale()) {
+            mService.dispatchNewAnimatorScaleLocked(this);
+        }
+    }
+    mNumWindow++;
+}
+```
+
+注释11会创建SurfaceSession，我们从这个开始看。
+
+> frameworks/base/core/java/android/view/SurfaceSession.java
+
+```java
+private long mNativeClient; // SurfaceComposerClient*
+public SurfaceSession() {
+    mNativeClient = nativeCreate();
+}
+```
+
+调用了JNI的nativeCreate方法，并且把返回的long指针地址保存起来，后面再调用JNI方法就把这个指针地址传过去就能直接访问JNI层创建的SurfaceComposerClient对象
+
+> frameworks/base/core/jni/android_view_SurfaceSession.cpp
+
+```cpp
+static jlong nativeCreate(JNIEnv* env, jclass clazz) {
+    SurfaceComposerClient* client = new SurfaceComposerClient();
+    client->incStrong((void*)nativeCreate);
+    return reinterpret_cast<jlong>(client);
+}
+```
+
+直接创建了SurfaceComposerClient对象
+
+> frameworks/native/libs/gui/SurfaceComposerClient.cpp
+
+```c++
+//初始化时状态为NO_INIT
+SurfaceComposerClient::SurfaceComposerClient() : mStatus(NO_INIT) {}
+
+void SurfaceComposerClient::onFirstRef() {
+    //12 获取SurfaceFlinger的代理对象
+    sp<ISurfaceComposer> sf(ComposerService::getComposerService());
+    //13 SurfaceFlinger不为空，并且SurfaceComposerClient状态为NO_INIT时创建连接
+    if (sf != nullptr && mStatus == NO_INIT) {
+        sp<ISurfaceComposerClient> conn;
+        conn = sf->createConnection();
+        if (conn != nullptr) {
+            //14 把返回的ISurfaceComposerClient的代理对象保存到mClinet中
+            mClient = conn;
+            mStatus = NO_ERROR;
+        }
+    }
+}
+```
+
+SurfaceComposerClient的构造函数中设置状态为NO_INIT，由于SurfaceComposerClient继承自RefBase所以会执行onFirstRef，这里会去拿SurfaceFlinger（注释12），如果不为空，并且状态是NO_INIT，会去执行SurfaceFlinger.createConnection来创建跟SurfaceFlinger的连接。我们先看下注释12
+
+```c++
+//SurfaceComposerClient.cpp
+/*static*/ sp<gui::ISurfaceComposer> ComposerServiceAIDL::getComposerService() {
+    ComposerServiceAIDL& instance = ComposerServiceAIDL::getInstance();
+    std::scoped_lock lock(instance.mMutex);
+    if (instance.mComposerService == nullptr) {
+        //如果instance.mComposerService为空，就执行ComposerService单例对象的connectLocked
+        if (ComposerServiceAIDL::getInstance().connectLocked()) {
+            ALOGD("ComposerServiceAIDL reconnected");
+        }
+    }
+    //instance.mComposerService即SurfaceFlinger的代理对象
+    return instance.mComposerService;
+}
+bool ComposerService::connectLocked() {
+    //获取SurfaceFlinger的代理对象，并缓存到单例对象的mComposerService中
+    const String16 name("SurfaceFlinger");
+    mComposerService = waitForService<ISurfaceComposer>(name);
+    if (mComposerService == nullptr) {
+        return false; // fatal error or permission problem
+    }
+
+    // Create the death listener.
+    //...
+    mDeathObserver = new DeathObserver(*const_cast<ComposerService*>(this));
+    IInterface::asBinder(mComposerService)->linkToDeath(mDeathObserver);
+    return true;
+}
+
+```
+
+instance.mComposerService即SurfaceFlinger的代理对象，如果为空，就会调connectLocked去获取SurfaceFlinger的代理对象，并绑定死亡监听。再继续看注释13处`sf->createConnection`
+
+```cpp
+sp<ISurfaceComposerClient> SurfaceFlinger::createConnection() {
+    const sp<Client> client = new Client(this);
+    return client->initCheck() == NO_ERROR ? client : nullptr;
+}
+
+//Client.h
+//Client肯定是个Binder对象，以Bn开头
+class Client : public BnSurfaceComposerClient{}
+
+//ISurfaceComposer.h
+class BnSurfaceComposerClient : public SafeBnInterface<ISurfaceComposerClient> {
+    status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) override;
+}
+```
+
+SurfaceFlinger直接返回了Client的代理对象，并保存在注释14的mClient中。后面客户端通过SurfaceComposerClient创建surface实际上是通过的mClient来做的，而mClient又是SurfaceFlinger的代理对象，这样，客户端就完成了与SurfaceFlinger的联系。
+
+
 
