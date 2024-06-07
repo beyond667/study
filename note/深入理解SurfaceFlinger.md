@@ -636,7 +636,109 @@ class BnSurfaceComposerClient : public SafeBnInterface<ISurfaceComposerClient> {
 }
 ```
 
-SurfaceFlinger直接返回了Client的代理对象，并保存在注释14的mClient中。后面客户端通过SurfaceComposerClient创建surface实际上是通过的mClient来做的，而mClient又是SurfaceFlinger的代理对象，这样，客户端就完成了与SurfaceFlinger的联系。
+SurfaceFlinger直接返回了Client的代理对象，并保存在注释14的mClient中。后面客户端通过SurfaceComposerClient创建surface是通过的Client的代理对象mClient来做的，实际上调用的还是在SurfaceFlinger中new的Client对象。这样，客户端就完成了与SurfaceFlinger的联系。  
 
+总结下，应用在启动中初始化ViewRootImpl时会创建跟WMS的连接Session，之后在ViewRootImpl.setView中会通过session调用到WMS.addWindow，这里会创建WindowState，并执行其attach，首次会通过JNI创建SurfaceSession，其实是返回了SurfaceComposerClient对象的地址，此对象里持有的mClient对象是通过surfaceflinger创建的Client对象。
 
+##### Surface创建流程
 
+下面分析View绘制到Surface创建过程。  
+
+我们知道，view绘制时会调用ViewRootImpl.requestLayout 
+
+```java
+public void requestLayout() {
+    if (!mHandlingLayoutInLayoutRequest) {
+        //这个做了主线程检查，非主线程直接抛异常，所以只能在主线程更新UI
+        checkThread();
+        mLayoutRequested = true;
+        scheduleTraversals();
+    }
+}
+
+void scheduleTraversals() {
+    if (!mTraversalScheduled) {
+        //mTraversalScheduled标志先设为true，待绘制流程开始后会把此标志改为false
+        mTraversalScheduled = true;
+        //插入同步屏障，保证之后只有异步消息才会被执行
+        mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
+        //编舞者发布异步消息，post个runnable，保证此runnable会尽快执行
+        mChoreographer.postCallback(
+            Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+        notifyRendererOfFramePending();
+        pokeDrawLockIfNeeded();
+    }
+}
+final TraversalRunnable mTraversalRunnable = new TraversalRunnable();
+final class TraversalRunnable implements Runnable {
+    @Override
+    public void run() {
+        doTraversal();
+    }
+}
+
+void doTraversal() {
+    if (mTraversalScheduled) {
+        //绘制流程开始，先把之前的标志设为false，并移除同步屏障，因为都到这里了，说明绘制流程已经可以开始了。
+        mTraversalScheduled = false;
+        mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+        
+        performTraversals();
+    }
+}
+
+private void performTraversals() {
+    relayoutResult = relayoutWindow(params, viewVisibility, insetsPending);
+	//具体绘制流程，performMeasure，performLayout，performDraw
+}
+```
+
+这个过程较简单，绘制时scheduleTraversals时会先往handler的MessageQueue中插入个同步屏障，然后编舞者往handler里post个异步消息，此时同步消息会先不执行，而是先执行插进来的异步消息，即先执行此runnable的run方法，之后执行doTraversal->performTraversals，这里会先relayoutWindow，之后再开始真正的绘制流程。
+
+```java
+private int relayoutWindow(WindowManager.LayoutParams params, int viewVisibility,boolean insetsPending) {
+//...
+    final boolean relayoutAsync;
+    if (LOCAL_LAYOUT
+        && (mViewFrameInfo.flags & FrameInfo.FLAG_WINDOW_VISIBILITY_CHANGED) == 0
+        && mWindowAttributes.type != TYPE_APPLICATION_STARTING
+        && mSyncSeqId <= mLastSyncSeqId
+        && winConfigFromAm.diff(winConfigFromWm, false /* compareUndefined */) == 0) {
+        //...
+        relayoutAsync = !positionChanged || !sizeChanged;
+    }else{
+        relayoutAsync = false;
+    }
+    
+    //如果绘制的内容跟上次的位置和大小都没变化，relayoutAsync会为true，走relayoutAsync流程，否则走relayout流程
+    if (relayoutAsync) {
+        mWindowSession.relayoutAsync(mWindow, params,
+                                     requestedWidth, requestedHeight, viewVisibility,
+                                     insetsPending ? WindowManagerGlobal.RELAYOUT_INSETS_PENDING : 0, mRelayoutSeq,
+                                     mLastSyncSeqId);
+    } else {
+        //15 调用session.relayout去请求SurfaceControl，注意，这里传的mSurfaceControl是直接new的没有内容的对象，是为了让WMS去往里面填充。
+        relayoutResult = mWindowSession.relayout(mWindow, params,
+                                                 requestedWidth, requestedHeight, viewVisibility,
+                                                 insetsPending ? WindowManagerGlobal.RELAYOUT_INSETS_PENDING : 0, mRelayoutSeq,
+                                                 mLastSyncSeqId, mTmpFrames, mPendingMergedConfiguration, mSurfaceControl,
+                                                 mTempInsets, mTempControls, mRelayoutBundle);
+    }
+    
+    //16 拿到的SurfaceControl数据传到Surface中
+    mSurface.copyFrom(mSurfaceControl);
+    //...
+    return relayoutResult;
+}
+
+public final Surface mSurface = new Surface();
+private final SurfaceControl mSurfaceControl = new SurfaceControl();
+
+//SurfaceControl.java
+public final class SurfaceControl implements Parcelable {}
+//Surface.java
+public class Surface implements Parcelable {}
+```
+
++ 注释15调用session.relayout去请求SurfaceControl，需要注意的是此时传的mSurfaceControl是直接new的没有内容的对象，是为了让WMS去往里面填充。
++ 注释16会把从WMS拿到的SurfaceControl数据拷贝到Surface中。
