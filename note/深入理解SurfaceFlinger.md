@@ -640,7 +640,7 @@ SurfaceFlinger直接返回了Client的代理对象，并保存在注释14的mCli
 
 总结下，应用在启动中初始化ViewRootImpl时会创建跟WMS的连接Session，之后在ViewRootImpl.setView中会通过session调用到WMS.addWindow，这里会创建WindowState，并执行其attach，首次会通过JNI创建SurfaceSession，其实是返回了SurfaceComposerClient对象的地址，此对象里持有的mClient对象是通过surfaceflinger创建的Client对象。
 
-##### Surface创建流程
+##### 2 Surface创建流程
 
 下面分析View绘制到Surface创建过程。  
 
@@ -741,4 +741,365 @@ public class Surface implements Parcelable {}
 ```
 
 + 注释15调用session.relayout去请求SurfaceControl，需要注意的是此时传的mSurfaceControl是直接new的没有内容的对象，是为了让WMS去往里面填充。
-+ 注释16会把从WMS拿到的SurfaceControl数据拷贝到Surface中。
++ 注释16会把从WMS拿到的SurfaceControl数据拷贝到Surface中。Surface和SurfaceControl本质都是Parcelable。
+
+继续看注释15的session.relayout
+
+```java
+//Session.java
+public int relayout(IWindow window, WindowManager.LayoutParams attrs){
+    int res = mService.relayoutWindow(this, window, attrs...);
+}
+//WMS.java
+public int relayoutWindow(Session session, IWindow client, LayoutParams attrs...){
+    synchronized (mGlobalLock) {
+        final WindowState win = windowForClientLocked(session, client, false);
+        if (win == null) {
+            return 0;
+        }
+        //...
+        
+        final boolean shouldRelayout = viewVisibility == View.VISIBLE &&
+            (win.mActivityRecord == null || win.mAttrs.type == TYPE_APPLICATION_STARTING
+             || win.mActivityRecord.isClientVisible());
+        
+         if (shouldRelayout && outSurfaceControl != null) {
+             //17 创建SurfaceControl，把客户端传过来的无内容的SurfaceControl传进去进行复制
+             result = createSurfaceControl(outSurfaceControl, result, win, winAnimator);
+         }
+        //...  
+    }
+}
+
+private int createSurfaceControl(SurfaceControl outSurfaceControl, int result,
+                                 WindowState win, WindowStateAnimator winAnimator) {
+    WindowSurfaceController surfaceController;
+    try {
+        //18 通过WindowStateAnimator.createSurfaceLocked创建WindowSurfaceController
+        surfaceController = winAnimator.createSurfaceLocked();
+    } finally {}
+    
+     if (surfaceController != null) {
+         //19 这里对客户端传过来的SurfaceControl进行了赋值
+         surfaceController.getSurfaceControl(outSurfaceControl);
+     }
+    return result;
+}
+
+//WindowStateAnimator.java
+WindowSurfaceController createSurfaceLocked() {
+    if (mSurfaceController != null) {
+        return mSurfaceController;
+    }
+    //20 直接new WindowSurfaceController
+    mSurfaceController = new WindowSurfaceController(attrs.getTitle().toString(), format,
+                                                     flags, this, attrs.type);
+    //...
+    return mSurfaceController;
+}
+```
+
+注释17-20可知，客户端往WMS请求SurfaceControl，其实主要是根据参数new了WindowSurfaceController，此对象里已经包括了客户端需要的SurfaceControl对象，再把此对象copy到客户端的对象即可。
+
+```java
+class WindowSurfaceController {
+    SurfaceControl mSurfaceControl;
+    
+    WindowSurfaceController(String name, int format, int flags, WindowStateAnimator animator,int windowType) {
+        title = name;
+        mService = animator.mService;
+        final WindowState win = animator.mWin;
+        mWindowType = windowType;
+        mWindowSession = win.mSession;
+
+        //构建者模式创建其Builder对象，再build创建实例
+        final SurfaceControl.Builder b = win.makeSurface()
+            .setParent(win.getSurfaceControl())
+            .setName(name)
+            .setFormat(format)
+            .setFlags(flags)
+            .setMetadata(METADATA_WINDOW_TYPE, windowType)
+            .setMetadata(METADATA_OWNER_UID, mWindowSession.mUid)
+            .setMetadata(METADATA_OWNER_PID, mWindowSession.mPid)
+            .setCallsite("WindowSurfaceController");
+
+        mSurfaceControl = b.build();
+    }
+}
+```
+
+构建者模式创建其Builder对象，再build创建实例
+
+```java
+public final class SurfaceControl implements Parcelable {
+    //21 4种Surface类型
+    public static final int FX_SURFACE_NORMAL   = 0x00000000;
+    public static final int FX_SURFACE_EFFECT = 0x00020000;
+    public static final int FX_SURFACE_CONTAINER = 0x00080000;
+    public static final int FX_SURFACE_BLAST = 0x00040000;
+    //Mask used for FX values above.
+    public static final int FX_SURFACE_MASK = 0x000F0000;
+    private static native long nativeCreate(SurfaceSession session, String name,
+                                            int w, int h, int format, int flags, long parentObject, Parcel metadata);
+    
+    
+    public SurfaceControl build() {
+        //22 校验参数
+        if (mWidth < 0 || mHeight < 0) {
+            throw new IllegalStateException("width and height must be positive or unset");
+        }
+        if ((mWidth > 0 || mHeight > 0) && (isEffectLayer() || isContainerLayer())) {
+            throw new IllegalStateException("Only buffer layers can set a valid buffer size.");
+        }
+		
+        if ((mFlags & FX_SURFACE_MASK) == FX_SURFACE_NORMAL) {
+            setBLASTLayer();
+        }
+
+        return new SurfaceControl(
+            mSession, mName, mWidth, mHeight, mFormat, mFlags, mParent, mMetadata,
+            mLocalOwnerView, mCallsite);
+    }
+
+    
+    private SurfaceControl(SurfaceSession session, String name, int w, int h, int format, int flags,
+                           SurfaceControl parent, SparseIntArray metadata, WeakReference<View> localOwnerView,
+                           String callsite){
+
+        mName = name;
+        mWidth = w;
+        mHeight = h;
+        mLocalOwnerView = localOwnerView;
+        Parcel metaParcel = Parcel.obtain();
+
+        //23 通过JNI创建SurfaceControl
+        mNativeObject = nativeCreate(session, name, w, h, format, flags,
+                                     parent != null ? parent.mNativeObject : 0, metaParcel);
+
+        mNativeHandle = nativeGetHandle(mNativeObject);
+    }
+}
+
+public Builder setBLASTLayer() {
+    return setFlags(FX_SURFACE_BLAST, FX_SURFACE_MASK);
+}
+```
+
+注释21和22先对Surface参数进行了校验，比如宽高不能为负数，宽高大于0时surface类型不能是Effect和Container类型，如果是Normal类型的直接设置为blast类型，这里介绍下几个Surface类型
+
++ FX_SURFACE_NORMAL，代表了一个标准Surface，这个是默认设置。
++ FX_SURFACE_EFFECT，代表了一个有纯色或者阴影效果的Surface。
++ FX_SURFACE_CONTAINER，代表了一个容器类Surface，这种Surface没有缓冲区，只是用来作为其他Surface的容器，或者是它自己的InputInfo的容器。
++ FX_SURFACE_BLAST。结合上面代码可知，其等同于FX_SURFACE_NORMAL。我们用到的大部分即是这种。
++ FX_SURFACE_MASK。标识位。某个Surface类型与其标识位做位运算来计算出具体的Surface类型。
+
+注释23通过JNI创建了SurfaceControl
+
+> frameworks/base/core/jni/android_view_SurfaceControl.cpp
+
+```cpp
+static jlong nativeCreate(JNIEnv* env, jclass clazz, jobject sessionObj,
+                          jstring nameStr, jint w, jint h, jint format, jint flags, jlong parentObject,
+                          jobject metadataParcel) {
+    sp<SurfaceComposerClient> client;
+    //24 基于SurfaceSession去获取SurfaceComposerClient
+    if (sessionObj != NULL) {
+        client = android_view_SurfaceSession_getClient(env, sessionObj);
+    } else {
+        client = SurfaceComposerClient::getDefault();
+    }
+    sp<SurfaceControl> surface;
+	//...
+    //25 SurfaceComposerClient.createSurfaceChecked去创建SurfaceControl
+    status_t err = client->createSurfaceChecked(String8(name.c_str()), w, h, format, &surface,flags, parentHandle, std::move(metadata));
+    
+    
+    return reinterpret_cast<jlong>(surface.get());
+}
+```
+
++ 注释24会通过SurfaceSession获取SurfaceComposerClient，由上面与SurfaceFlinger创建连接可知，此SurfaceComposerClient是在windowState第一次attach时创建的
++ 注释25通过SurfaceComposerClient.createSurfaceChecked去创建SurfaceControl
+
+> frameworks/native/libs/gui/SurfaceComposerClient.cpp
+
+```cpp
+status_t SurfaceComposerClient::createSurfaceChecked(const String8& name, uint32_t w, uint32_t h,
+                                                     PixelFormat format,
+                                                     sp<SurfaceControl>* outSurface, uint32_t flags,
+                                                     const sp<IBinder>& parentHandle,
+                                                     LayerMetadata metadata,
+                                                     uint32_t* outTransformHint) {
+    sp<SurfaceControl> sur;
+    status_t err = mStatus;
+
+    if (mStatus == NO_ERROR) {
+        sp<IBinder> handle;
+        sp<IGraphicBufferProducer> gbp;
+
+        uint32_t transformHint = 0;
+        int32_t id = -1;
+        //26 调用服务端SurfaceFlinger进程Client的createSurface
+        err = mClient->createSurface(name, w, h, format, flags, parentHandle, std::move(metadata),
+                                     &handle, &gbp, &id, &transformHint);
+
+        if (outTransformHint) {
+            *outTransformHint = transformHint;
+        }
+
+        if (err == NO_ERROR) {
+            //27 基于注释26返回的handle，system_server进程中创建个SurfaceControl
+            *outSurface =
+                new SurfaceControl(this, handle, gbp, id, w, h, format, transformHint, flags);
+        }
+    }
+    return err;
+}
+```
+
++ 注释26通过binder通信调用到SurfaceFlinger服务端Client这个binder的createSurface方法
++ 注释27基于26的返回handle，在system_server进程中创建个SurfaceControl
+
+再看注释26中SurfaceFlinger进程创建Surface的过程
+
+> frameworks/native/services/surfaceflinger/Client.cpp
+
+```c++
+status_t Client::createSurface(const String8& name, uint32_t /* w */, uint32_t /* h */,
+                               PixelFormat /* format */, uint32_t flags,
+                               const sp<IBinder>& parentHandle, LayerMetadata metadata,
+                               sp<IBinder>* outHandle, sp<IGraphicBufferProducer>* /* gbp */,
+                               int32_t* outLayerId, uint32_t* outTransformHint) {
+
+    return mFlinger->createLayer(args, outHandle, parentHandle, outLayerId, nullptr,
+                                 outTransformHint);
+}
+```
+
+Client.createSurface调用到了SurfaceFlinger.createLayer
+
+> frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+
+```cpp
+status_t SurfaceFlinger::createLayer(LayerCreationArgs& args, sp<IBinder>* outHandle,
+                                     const sp<IBinder>& parentHandle, int32_t* outLayerId,
+                                     const sp<Layer>& parentLayer, uint32_t* outTransformHint) {
+    
+    switch (args.flags & ISurfaceComposerClient::eFXSurfaceMask) {
+        case ISurfaceComposerClient::eFXSurfaceBufferQueue:
+        case ISurfaceComposerClient::eFXSurfaceBufferState: {
+            //28 创建BufferStateLayer
+            result = createBufferStateLayer(args, outHandle, &layer);
+            std::atomic<int32_t>* pendingBufferCounter = layer->getPendingBufferCounter();
+            if (pendingBufferCounter) {
+                std::string counterName = layer->getPendingBufferCounterName();
+                mBufferCountTracker.add((*outHandle)->localBinder(), counterName,
+                                        pendingBufferCounter);
+            }
+        } break;
+        case ISurfaceComposerClient::eFXSurfaceEffect:
+            result = createEffectLayer(args, outHandle, &layer);
+            break;
+        case ISurfaceComposerClient::eFXSurfaceContainer:
+            result = createContainerLayer(args, outHandle, &layer);
+            break;
+        default:
+            result = BAD_VALUE;
+            break;
+    }
+    
+    if (result != NO_ERROR) {
+        return result;
+    }
+
+    bool addToRoot = args.addToRoot && callingThreadHasUnscopedSurfaceFlingerAccess();
+    //30 添加客户端的layer
+    result = addClientLayer(args.client, *outHandle, layer, parent, addToRoot, outTransformHint);
+    if (result != NO_ERROR) {
+        return result;
+    }
+    *outLayerId = layer->sequence;
+    return result;
+}
+
+status_t SurfaceFlinger::createBufferStateLayer(LayerCreationArgs& args, sp<IBinder>* handle,
+                                                sp<Layer>* outLayer) {
+    args.textureName = getNewTexture();
+    //29 通过默认工厂createBufferStateLayer来创建
+    *outLayer = getFactory().createBufferStateLayer(args);
+    *handle = (*outLayer)->getHandle();
+    return NO_ERROR;
+}
+```
+
+SurfaceFlinger创建layer的核心代码。
+
+首先，根据不同的surface类型创建不同的layer，跟我们上面看到的4种surface类型一一对应。对于大部分应都是走注释28创建BufferStateLayer，其是通过注释29处getFactory().createBufferStateLayer来创建BufferStateLayer的。注释30在创建完layer后会通过addClientLayer来记录客户端的layer。
+
+> frameworks/native/services/surfaceflinger/SurfaceFlingerDefaultFactory.cpp
+
+```cpp
+sp<ContainerLayer> DefaultFactory::createContainerLayer(const LayerCreationArgs& args) {
+    return new ContainerLayer(args);
+}
+
+sp<BufferQueueLayer> DefaultFactory::createBufferQueueLayer(const LayerCreationArgs& args) {
+    return new BufferQueueLayer(args);
+}
+
+sp<BufferStateLayer> DefaultFactory::createBufferStateLayer(const LayerCreationArgs& args) {
+    return new BufferStateLayer(args);
+}
+
+```
+
+SurfaceFlinger的默认工厂SurfaceFlingerDefaultFactory创建这3个类型的layer只是new了其对象，他们都继承于Layer，其初始化时会先执行onFirstRef
+
+```cpp
+//Layer.cpp
+void Layer::onFirstRef() {
+    mFlinger->onLayerFirstRef(this);
+}
+
+//SurfaceFlinger.cpp
+std::atomic<size_t> mNumLayers = 0;
+void SurfaceFlinger::onLayerFirstRef(Layer* layer) {
+    mNumLayers++;
+    if (!layer->isRemovedFromCurrentState()) {
+        mScheduler->registerLayer(layer);
+    }
+}
+```
+
+SurfaceFlinger里的mNumLayers记录所有的layer数量，此时BufferStateLayer已经创建好了。  
+
+我们继续看注释29处getHandle
+
+```cpp
+//Layer.cpp
+sp<IBinder> Layer::getHandle() {
+    if (mGetHandleCalled) {
+        return nullptr;
+    }
+    mGetHandleCalled = true;
+    return new Handle(mFlinger, this);
+}
+```
+
+这个写法，只有第一次调用才返回了new handler，再调用就返回空，即getHandle期望用户只在创建layer时调用一次。
+
+```cpp
+//layer.h
+class Handle : public BBinder, public LayerCleaner {
+    public:
+    Handle(const sp<SurfaceFlinger>& flinger, const sp<Layer>& layer)
+        : LayerCleaner(flinger, layer, this), owner(layer) {}
+    const String16& getInterfaceDescriptor() const override { return kDescriptor; }
+
+    static const String16 kDescriptor;
+    wp<Layer> owner;
+};
+```
+
+Handle其实就是个binder对象，相当于SurfaceFlinger把此对象的代理对象返回给SurfaceComposerClient的进程，即wms进程，再在注释27处基于此binder对象来创建SurfaceControl对象，再把此对象的内存地址传给wms进程的java端，后面WMS就可以基于此地址来操作SurfaceControl，即变相操作SurfaceFlinger的layer完成合成等操作。
+
