@@ -1065,6 +1065,7 @@ void Layer::onFirstRef() {
 std::atomic<size_t> mNumLayers = 0;
 void SurfaceFlinger::onLayerFirstRef(Layer* layer) {
     mNumLayers++;
+    //如果当前layer没有父layer，调用mScheduler->registerLayer注册
     if (!layer->isRemovedFromCurrentState()) {
         mScheduler->registerLayer(layer);
     }
@@ -1101,5 +1102,144 @@ class Handle : public BBinder, public LayerCleaner {
 };
 ```
 
-Handle其实就是个binder对象，相当于SurfaceFlinger把此对象的代理对象返回给SurfaceComposerClient的进程，即wms进程，再在注释27处基于此binder对象来创建SurfaceControl对象，再把此对象的内存地址传给wms进程的java端，后面WMS就可以基于此地址来操作SurfaceControl，即变相操作SurfaceFlinger的layer完成合成等操作。
+Handle其实就是个binder对象，相当于SurfaceFlinger把此对象的代理对象返回给SurfaceComposerClient的进程，即wms进程，再在注释27处基于此binder对象来创建SurfaceControl对象，再把SurfaceControl对象的内存地址传给wms进程的java端，后面WMS就可以基于此地址来操作SurfaceControl，即变相操作SurfaceFlinger的layer完成合成等操作。
+
+到这里完成了layer和handle的创建以及在handle里绑定了layer，但是Client和SurfaceFlinger并不清楚其关系，所以在SurfaceFlinger::createLayer的注释30处调用addClientLayer来完成client和SurfaceFlinger对两者的记录。
+
+```c++
+//SurfaceFlinger.h
+enum {
+    eTransactionNeeded = 0x01,
+    eTraversalNeeded = 0x02,
+    eDisplayTransactionNeeded = 0x04,
+    eTransformHintUpdateNeeded = 0x08,
+    eTransactionFlushNeeded = 0x10,
+    eTransactionMask = 0x1f,
+};
+//SurfaceFlinger.cpp
+status_t SurfaceFlinger::addClientLayer(const sp<Client>& client, const sp<IBinder>& handle,
+                                        const sp<Layer>& layer, const wp<Layer>& parent,
+                                        bool addToRoot, uint32_t* outTransformHint) {
+	//...
+    if (client != nullptr) {
+        //31 Client里记录handle和layer
+        client->attachLayer(handle, layer);
+    }
+    //32 设置当前事务的标记为eTransactionNeeded
+    setTransactionFlags(eTransactionNeeded);
+    return NO_ERROR;
+}
+
+//Client.cpp
+DefaultKeyedVector< wp<IBinder>, wp<Layer> > mLayers;
+void Client::attachLayer(const sp<IBinder>& handle, const sp<Layer>& layer)
+{
+    Mutex::Autolock _l(mLock);
+    mLayers.add(handle, layer);
+}
+```
+
++ 注释31是Client里记录Handle和layer的关系。可以看到在Client.cpp里由成员变量mLayers记录。
++ 注释32是SurfaceFlinger里记录Handle和Layer的关系。需要注意的是Android11,12,13的实现均不完全一样，在Android13上是设置了事务的标记为eTransactionNeeded（0x01）
+
+```c++
+void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule schedule,
+                                         const sp<IBinder>& applyToken, FrameHint frameHint) {
+    modulateVsync(&VsyncModulator::setTransactionSchedule, schedule, applyToken);
+    if (const bool scheduled = mTransactionFlags.fetch_or(mask) & mask; !scheduled) {
+        scheduleCommit(frameHint);
+    }
+}
+void SurfaceFlinger::scheduleCommit(FrameHint hint) {
+    if (hint == FrameHint::kActive) {
+        mScheduler->resetIdleTimer();
+    }
+    notifyDisplayUpdateImminent();
+    mScheduler->scheduleFrame();
+}
+void SurfaceFlinger::notifyDisplayUpdateImminent() {
+    if (!mEarlyWakeUpEnabled) {
+        mPowerAdvisor->notifyDisplayUpdateImminent();
+        return;
+    }
+    #ifdef EARLY_WAKEUP_FEATURE
+    //...
+    mDisplayExtnIntf->NotifyEarlyWakeUp(true, false);
+    #endif
+}
+```
+
+Android13上c++事务这块调用关系(由scheduleCommit到commit的过程)没完全看懂。  
+
+不过既然是基于事务提交scheduleCommit，就有处理的地方，我们直接看commit。
+
+```cpp
+bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) FTL_FAKE_GUARD(kMainThreadContext) {
+    //...这里只关注layer创建的事务
+    needsTraversal |= commitCreatedLayers();
+    needsTraversal |= flushTransactionQueues(vsyncId);
+    //...
+}
+bool SurfaceFlinger::commitCreatedLayers() {
+    //...
+    for (const auto& createdLayer : createdLayers) {
+        handleLayerCreatedLocked(createdLayer);
+    }
+    createdLayers.clear();
+    mLayersAdded = true;
+    return true;
+}
+void SurfaceFlinger::handleLayerCreatedLocked(const LayerCreatedState& state) {
+    //...
+	//33 如果没有父layer，在mCurrentState.layersSortedByZ里添加layer
+    if (parent == nullptr && addToRoot) {
+        layer->setIsAtRoot(true);
+        mCurrentState.layersSortedByZ.add(layer);
+    } else if (parent == nullptr) {
+        layer->onRemovedFromCurrentState();
+    } else if (parent->isRemovedFromCurrentState()) {
+        parent->addChild(layer);
+        layer->onRemovedFromCurrentState();
+    } else {
+        parent->addChild(layer);
+    }
+}
+bool SurfaceFlinger::flushTransactionQueues(int64_t vsyncId) {
+   	//...
+    return applyTransactions(transactions, vsyncId);
+}
+bool SurfaceFlinger::applyTransactions(std::vector<TransactionState>& transactions,int64_t vsyncId) {
+    for (auto& transaction : transactions) {
+        needsTraversal |=
+            applyTransactionState(transaction.frameTimelineInfo, transaction.states,
+                                  transaction.displays, transaction.flags,
+                                  transaction.inputWindowCommands,
+                                  transaction.desiredPresentTime, transaction.isAutoTimestamp,
+                                  transaction.buffer, transaction.postTime,
+                                  transaction.permissions, transaction.hasListenerCallbacks,
+                                  transaction.listenerCallbacks, transaction.originPid,
+                                  transaction.originUid, transaction.id);
+    }
+    return needsTraversal;
+}
+bool SurfaceFlinger::applyTransactionState(...Vector<ComposerState>& states...){
+    //...
+    for (int i = 0; i < states.size(); i++) {
+        //34
+        clientStateFlags |= setClientStateLocked(frameTimelineInfo, state, desiredPresentTime,
+                                                 isAutoTimestamp, postTime, permissions);
+        
+        if ((flags & eAnimation) && state.state.surface) {
+            //此时已经在surface中绑定了handle和layer的关系，这里可以直接通过fromHandle来根据handle拿layer
+            if (const auto layer = fromHandle(state.state.surface).promote()) {
+                using LayerUpdateType = scheduler::LayerHistory::LayerUpdateType;
+                mScheduler->recordLayerHistory(layer.get(),
+                                               isAutoTimestamp ? 0 : desiredPresentTime,
+                                               LayerUpdateType::AnimationTX);
+            }
+        }
+
+    }
+}
+```
 
