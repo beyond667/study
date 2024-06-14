@@ -688,6 +688,7 @@ void doTraversal() {
 }
 
 private void performTraversals() {
+    //先准备窗口，再开始具体绘制流程
     relayoutResult = relayoutWindow(params, viewVisibility, insetsPending);
 	//具体绘制流程，performMeasure，performLayout，performDraw
 }
@@ -764,7 +765,7 @@ public int relayoutWindow(Session session, IWindow client, LayoutParams attrs...
              || win.mActivityRecord.isClientVisible());
         
          if (shouldRelayout && outSurfaceControl != null) {
-             //17 创建SurfaceControl，把客户端传过来的无内容的SurfaceControl传进去进行复制
+             //17 创建SurfaceControl，把客户端传过来的无内容的SurfaceControl传进去进行赋值
              result = createSurfaceControl(outSurfaceControl, result, win, winAnimator);
          }
         //...  
@@ -918,8 +919,8 @@ static jlong nativeCreate(JNIEnv* env, jclass clazz, jobject sessionObj,
 }
 ```
 
-+ 注释24会通过SurfaceSession获取SurfaceComposerClient，由上面与SurfaceFlinger创建连接可知，此SurfaceComposerClient是在windowState第一次attach时创建的
-+ 注释25通过SurfaceComposerClient.createSurfaceChecked去创建SurfaceControl
++ 注释24会通过java层传过来的SurfaceSession的地址获取SurfaceComposerClient，由上面与SurfaceFlinger创建连接可知，此SurfaceComposerClient是在windowState第一次attach时通过jni创建，java层持有了其地址
++ 注释25通过SurfaceComposerClient.createSurfaceChecked去创建SurfaceControl，传新创建的surface地址以供创建后赋值
 
 > frameworks/native/libs/gui/SurfaceComposerClient.cpp
 
@@ -957,10 +958,10 @@ status_t SurfaceComposerClient::createSurfaceChecked(const String8& name, uint32
 }
 ```
 
-+ 注释26通过binder通信调用到SurfaceFlinger服务端Client这个binder的createSurface方法
++ 注释26通过binder通信调用到SurfaceFlinger服务端Client这个binder的createSurface方法，这里传了个新创建的handle这个IBinder的地址进去，其实新创建的Surface，对SurfaceFlinger来说是Layer，会被存在这个Binder的真实对象中。
 + 注释27基于26的返回handle，在system_server进程中创建个SurfaceControl
 
-再看注释26中SurfaceFlinger进程创建Surface的过程
+再看注释26中SurfaceFlinger进程创建Surface，即Layer的过程
 
 > frameworks/native/services/surfaceflinger/Client.cpp
 
@@ -976,7 +977,7 @@ status_t Client::createSurface(const String8& name, uint32_t /* w */, uint32_t /
 }
 ```
 
-Client.createSurface调用到了SurfaceFlinger.createLayer
+Client.createSurface调用到了SurfaceFlinger.createLayer，从方法名称上也可以理解，`对SurfaceFlinger来说，创建Surface也就是创建layer`
 
 > frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
 
@@ -984,7 +985,7 @@ Client.createSurface调用到了SurfaceFlinger.createLayer
 status_t SurfaceFlinger::createLayer(LayerCreationArgs& args, sp<IBinder>* outHandle,
                                      const sp<IBinder>& parentHandle, int32_t* outLayerId,
                                      const sp<Layer>& parentLayer, uint32_t* outTransformHint) {
-    
+    //根据不同的Surface类型，创建不同的layer
     switch (args.flags & ISurfaceComposerClient::eFXSurfaceMask) {
         case ISurfaceComposerClient::eFXSurfaceBufferQueue:
         case ISurfaceComposerClient::eFXSurfaceBufferState: {
@@ -1074,7 +1075,7 @@ void SurfaceFlinger::onLayerFirstRef(Layer* layer) {
 
 SurfaceFlinger里的mNumLayers记录所有的layer数量，此时BufferStateLayer已经创建好了。  
 
-我们继续看注释29处getHandle
+我们继续看注释29处基于layer获取Handle的方法getHandle
 
 ```cpp
 //Layer.cpp
@@ -1102,9 +1103,9 @@ class Handle : public BBinder, public LayerCleaner {
 };
 ```
 
-Handle其实就是个binder对象，相当于SurfaceFlinger把此对象的代理对象返回给SurfaceComposerClient的进程，即wms进程，再在注释27处基于此binder对象来创建SurfaceControl对象，再把SurfaceControl对象的内存地址传给wms进程的java端，后面WMS就可以基于此地址来操作SurfaceControl，即变相操作SurfaceFlinger的layer完成合成等操作。
+Handle其实就是个binder对象，相当于SurfaceFlinger把此对象的代理对象返回给SurfaceComposerClient的进程，即wms所在的进程-system_server进程，再在注释27处基于此binder对象来创建SurfaceControl对象，再把SurfaceControl对象的内存地址传给wms进程的java端，后面WMS就可以基于此地址来操作SurfaceControl，即变相操作SurfaceFlinger的layer完成合成等操作。
 
-到这里完成了layer和handle的创建以及在handle里绑定了layer，但是Client和SurfaceFlinger并不清楚其关系，所以在SurfaceFlinger::createLayer的注释30处调用addClientLayer来完成client和SurfaceFlinger对两者的记录。
+到这里完成了layer和handle的创建以及在handle里绑定了layer，但是Client和SurfaceFlinger并不清楚其关系，所以在注释30处SurfaceFlinger::createLayer调用addClientLayer来完成client和SurfaceFlinger对两者的记录。
 
 ```c++
 //SurfaceFlinger.h
@@ -1116,16 +1117,33 @@ enum {
     eTransactionFlushNeeded = 0x10,
     eTransactionMask = 0x1f,
 };
+struct LayerCreatedState {
+    LayerCreatedState(const wp<Layer>& layer, const wp<Layer> parent, bool addToRoot)
+        : layer(layer), initialParent(parent), addToRoot(addToRoot) {}
+    wp<Layer> layer;
+    //如果有父类layer，会记录在这里
+    wp<Layer> initialParent;
+    bool addToRoot;
+};
+//记录SurfaceFlinger所有新创建的layer
+std::vector<LayerCreatedState> mCreatedLayers GUARDED_BY(mCreatedLayersLock);
+
 //SurfaceFlinger.cpp
-status_t SurfaceFlinger::addClientLayer(const sp<Client>& client, const sp<IBinder>& handle,
+status_t SurfaceFlinger::
+    addClientLayer(const sp<Client>& client, const sp<IBinder>& handle,
                                         const sp<Layer>& layer, const wp<Layer>& parent,
                                         bool addToRoot, uint32_t* outTransformHint) {
 	//...
+    {
+        std::scoped_lock<std::mutex> lock(mCreatedLayersLock);
+        //31 把新创建的layer缓存到SurfaceFlinger的mCreatedLayers中
+        mCreatedLayers.emplace_back(layer, parent, addToRoot);
+    }
     if (client != nullptr) {
-        //31 Client里记录handle和layer
+        //32 Client里记录handle和layer
         client->attachLayer(handle, layer);
     }
-    //32 设置当前事务的标记为eTransactionNeeded
+    //33 设置当前事务的标记为eTransactionNeeded
     setTransactionFlags(eTransactionNeeded);
     return NO_ERROR;
 }
@@ -1139,8 +1157,9 @@ void Client::attachLayer(const sp<IBinder>& handle, const sp<Layer>& layer)
 }
 ```
 
-+ 注释31是Client里记录Handle和layer的关系。可以看到在Client.cpp里由成员变量mLayers记录。
-+ 注释32是SurfaceFlinger里记录Handle和Layer的关系。需要注意的是Android11,12,13的实现均不完全一样，在Android13上是设置了事务的标记为eTransactionNeeded（0x01）
++ 注释31是SurfaceFlinger里的mCreatedLayers缓存了所有新创建的layer。
++ 注释32是Client里记录Handle和layer的关系。可以看到在Client.cpp里由成员变量mLayers记录。
++ 注释33会通过改变事务的flag来触发SurfaceFlinger来管理此layer。需要注意的是Android11,12,13的实现均不完全一样，在Android13上是设置了事务的标记为eTransactionNeeded（0x01）
 
 ```c++
 void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule schedule,
@@ -1171,7 +1190,7 @@ void SurfaceFlinger::notifyDisplayUpdateImminent() {
 
 Android13上c++事务这块调用关系(由scheduleCommit到commit的过程)没完全看懂。  
 
-不过既然是基于事务提交scheduleCommit，就有处理的地方，我们直接看commit。
+不过既然是基于事务有提交scheduleCommit，就有处理的地方，最终会调用到其commit方法。
 
 ```cpp
 bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) FTL_FAKE_GUARD(kMainThreadContext) {
@@ -1181,17 +1200,29 @@ bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expected
     //...
 }
 bool SurfaceFlinger::commitCreatedLayers() {
-    //...
+    std::vector<LayerCreatedState> createdLayers;
+    {
+        std::scoped_lock<std::mutex> lock(mCreatedLayersLock);
+        //先把SurfaceFlinger上面缓存的所有新创建的Layer拿出来存到本地变量createdLayers中
+        createdLayers = std::move(mCreatedLayers);
+        //清空SurfaceFlinger的缓存
+        mCreatedLayers.clear();
+        if (createdLayers.size() == 0) {
+            return false;
+        }
+    }
+    //遍历新创建的layer
     for (const auto& createdLayer : createdLayers) {
         handleLayerCreatedLocked(createdLayer);
     }
+    //清空本地缓存
     createdLayers.clear();
     mLayersAdded = true;
     return true;
 }
 void SurfaceFlinger::handleLayerCreatedLocked(const LayerCreatedState& state) {
     //...
-	//33 如果没有父layer，在mCurrentState.layersSortedByZ里添加layer
+	//34 如果没有父layer，在mCurrentState.layersSortedByZ里添加layer
     if (parent == nullptr && addToRoot) {
         layer->setIsAtRoot(true);
         mCurrentState.layersSortedByZ.add(layer);
@@ -1204,6 +1235,8 @@ void SurfaceFlinger::handleLayerCreatedLocked(const LayerCreatedState& state) {
         parent->addChild(layer);
     }
 }
+
+
 bool SurfaceFlinger::flushTransactionQueues(int64_t vsyncId) {
    	//...
     return applyTransactions(transactions, vsyncId);
@@ -1225,12 +1258,12 @@ bool SurfaceFlinger::applyTransactions(std::vector<TransactionState>& transactio
 bool SurfaceFlinger::applyTransactionState(...Vector<ComposerState>& states...){
     //...
     for (int i = 0; i < states.size(); i++) {
-        //34
+        //35 设置layer的具体信息
         clientStateFlags |= setClientStateLocked(frameTimelineInfo, state, desiredPresentTime,
                                                  isAutoTimestamp, postTime, permissions);
         
         if ((flags & eAnimation) && state.state.surface) {
-            //此时已经在surface中绑定了handle和layer的关系，这里可以直接通过fromHandle来根据handle拿layer
+            //可以直接通过fromHandle来根据handle拿layer
             if (const auto layer = fromHandle(state.state.surface).promote()) {
                 using LayerUpdateType = scheduler::LayerHistory::LayerUpdateType;
                 mScheduler->recordLayerHistory(layer.get(),
@@ -1241,5 +1274,95 @@ bool SurfaceFlinger::applyTransactionState(...Vector<ComposerState>& states...){
 
     }
 }
+
+uint32_t SurfaceFlinger::setClientStateLocked(... ComposerState& composerState...){
+    layer_state_t& s = composerState.state;
+    //...
+    const uint64_t what = s.what;
+    sp<Layer> layer = nullptr;
+    if (s.surface) {
+        layer = fromHandle(s.surface).promote();
+    } 
+    if (layer == nullptr) {
+        return 0;  
+    }
+    
+    //根据参数对layer进行设置
+    if (what & layer_state_t::ePositionChanged) {
+        if (layer->setPosition(s.x, s.y)) {
+            flags |= eTraversalNeeded;
+        }
+    }
+    if (what & layer_state_t::eSizeChanged) {
+        if (layer->setSize(s.w, s.h)) {
+            flags |= eTraversalNeeded;
+        }
+    }
+    //...省略其他属性设置
+    return flags;
+}
 ```
 
+commit这块稍微有点复杂，通过commitCreatedLayers和flushTransactionQueues来判断needsTraversal
+
++ 注释34处是commitCreatedLayers里往SurfaceFlinger的mCurrentState.layersSortedByZ里缓存了所有的layer，相当于SurfaceFlinger中记录了所有管理的layer
++ 注释35是取出事务处理的流程，在setClientStateLocked里会SF会根据配置来对Layer进行处理。需要注意的是layer_state_t的surface参数其实就是handle。
+
+```c++
+//LayerState.h
+struct ComposerState {
+    layer_state_t state;
+    status_t write(Parcel& output) const;
+    status_t read(const Parcel& input);
+};
+struct layer_state_t {
+    status_t write(Parcel& output) const;
+    status_t read(const Parcel& input);
+    sp<IBinder> surface;
+    uint32_t w;
+    uint32_t h;
+    sp<SurfaceControl> reparentSurfaceControl;
+    sp<SurfaceControl> relativeLayerSurfaceControl;
+    float shadowRadius;
+    //...
+}
+```
+
+这个layer_state_t里包括了layer的所有信息。
+
+再看注释27中SurfaceComposerClient创建完Surface后基于Handle构建new SurfaceControl
+
+```c++
+//SurfaceComposerClient.cpp
+*outSurface = new SurfaceControl(this, handle, gbp, id, w, h, format, transformHint, flags);
+
+//SurfaceControl.cpp
+SurfaceControl::SurfaceControl(const sp<SurfaceComposerClient>& client, const sp<IBinder>& handle,
+                               const sp<IGraphicBufferProducer>& gbp, int32_t layerId,
+                               uint32_t w, uint32_t h, PixelFormat format, uint32_t transform,
+                               uint32_t flags)
+    : mClient(client),
+mHandle(handle),
+mGraphicBufferProducer(gbp),
+mLayerId(layerId),
+mTransformHint(transform),
+mWidth(w),
+mHeight(h),
+mFormat(format),
+mCreateFlags(flags) {}
+
+//SurfaceControl.h
+sp<SurfaceComposerClient>   mClient;
+sp<IBinder>                 mHandle;
+sp<IGraphicBufferProducer>  mGraphicBufferProducer;
+```
+
+handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址返回给java层，其存在WindowSurfaceController的mSurfaceControl，再把其数据拷贝给客户端传过来的SurfaceControl中，相当于客户端的ViewRootImpl和服务端的WindowSurfaceController持有的同一个由JNI层创建的SurfaceControl对象地址，并且都持有了SF创建的layer的代理地址即handle。
+
+到这里创建Layer的过程就结束了。  
+
+做个小结：
+
++ 客户端进程：在performTraversals完成绘制流程中，会先判断窗口是否有改变，有的话会通过session.relayout调用wms.relayoutWindow去处理窗口，这里会把客户端新建的SurfaceControl传进去以供WMS里面获取后传过来，如果wms返回了数据，会把其存到本地的Surface对象中。
++ WMS进程relayoutWindow里会先拿之前创建的WindowState判断是否要重新布局，需要的话就创建个WindowSurfaceController对象，在其构造函数中会基于构建者模式创建SurfaceControl，SurfaceControl的构造函数会通过JNI去创建SurfaceControl。如果JNI创建成功，就会把SurfaceControl数据拷贝到客户端传进来的对象里。
++ 再看JNI创建SurfaceControl的过程，此时还在wms进程，会先通过之前与SF创建连接时拿到的SurfaceComposerClient调用SF进程Client服务端的createSurfaceChecked方法，其会调用SF的createLayer，主要先根据不同的surface类型创建不同的layer，大部分情况下都是创建BufferStateLayer，然后再通过layer.getHandle获取一个Binder对象，此方法只在创建layer时调用一次，再次调用会返回空。此Handle主要是存到给WMS进程返回的SurfaceControl中，以供WMS通过Handle来操作具体的layer
