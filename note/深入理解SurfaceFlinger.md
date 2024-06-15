@@ -727,7 +727,11 @@ private int relayoutWindow(WindowManager.LayoutParams params, int viewVisibility
     }
     
     //16 拿到的SurfaceControl数据传到Surface中
-    mSurface.copyFrom(mSurfaceControl);
+    if (!useBLAST()) {
+        mSurface.copyFrom(mSurfaceControl);
+    } else {
+        updateBlastSurfaceIfNeeded();
+    }
     //...
     return relayoutResult;
 }
@@ -742,7 +746,7 @@ public class Surface implements Parcelable {}
 ```
 
 + 注释15调用session.relayout去请求SurfaceControl，需要注意的是此时传的mSurfaceControl是直接new的没有内容的对象，是为了让WMS去往里面填充。
-+ 注释16会把从WMS拿到的SurfaceControl数据拷贝到Surface中。Surface和SurfaceControl本质都是Parcelable。
++ 注释16不管useBLAST是否为真都会创建Surface，不同的是如果为false就直接拷贝，为true的话就通过updateBlastSurfaceIfNeeded去创建Surface，这块在下一小节再细看。Surface和SurfaceControl本质都是Parcelable。
 
 继续看注释15的session.relayout
 
@@ -1366,3 +1370,149 @@ handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址�
 + 客户端进程：在performTraversals完成绘制流程中，会先判断窗口是否有改变，有的话会通过session.relayout调用wms.relayoutWindow去处理窗口，这里会把客户端新建的SurfaceControl传进去以供WMS里面获取后传过来，如果wms返回了数据，会把其存到本地的Surface对象中。
 + WMS进程relayoutWindow里会先拿之前创建的WindowState判断是否要重新布局，需要的话就创建个WindowSurfaceController对象，在其构造函数中会基于构建者模式创建SurfaceControl，SurfaceControl的构造函数会通过JNI去创建SurfaceControl。如果JNI创建成功，就会把SurfaceControl数据拷贝到客户端传进来的对象里。
 + 再看JNI创建SurfaceControl的过程，此时还在wms进程，会先通过之前与SF创建连接时拿到的SurfaceComposerClient调用SF进程Client服务端的createSurfaceChecked方法，其会调用SF的createLayer，主要先根据不同的surface类型创建不同的layer，大部分情况下都是创建BufferStateLayer，然后再通过layer.getHandle获取一个Binder对象，此方法只在创建layer时调用一次，再次调用会返回空。此Handle主要是存到给WMS进程返回的SurfaceControl中，以供WMS通过Handle来操作具体的layer
+
+##### Surface的初始化
+
+上一小节中，客户端和WMS内部的SurfaceControl都已关联了SF创建的SurfaceControl的地址，还有handle的代理对象的地址。我们继续看ViewRootImpl.relayoutWindow后面的流程注释16处 
+
+```java
+//ViewRootImpl.relayoutWindow
+private int relayoutWindow(WindowManager.LayoutParams params...){
+    // 注释16 认情况下useBLAST都是返回true
+    if (!useBLAST()) {
+        mSurface.copyFrom(mSurfaceControl);
+    } else {
+        updateBlastSurfaceIfNeeded();
+    }
+}
+
+void updateBlastSurfaceIfNeeded() {
+    if (!mSurfaceControl.isValid()) {
+        return;
+    }
+
+    //如果已经创建过mBlastBufferQueue，并且执行其update返回的false，即无更新时直接返回
+    if (mBlastBufferQueue != null && mBlastBufferQueue.isSameSurfaceControl(mSurfaceControl)) {
+        mBlastBufferQueue.update(mSurfaceControl,
+                                 mSurfaceSize.x, mSurfaceSize.y,
+                                 mWindowAttributes.format);
+        return;
+    }
+    if (mBlastBufferQueue != null) {
+        mBlastBufferQueue.destroy();
+    }
+    //36 这里会创建BLASTBufferQueue
+    mBlastBufferQueue = new BLASTBufferQueue(mTag, mSurfaceControl,
+                                             mSurfaceSize.x, mSurfaceSize.y, mWindowAttributes.format);
+    mBlastBufferQueue.setTransactionHangCallback(sTransactionHangCallback);
+    ScrollOptimizer.setBLASTBufferQueue(mBlastBufferQueue);
+    //37 执行BLASTBufferQueue的createSurface来创建Surface
+    Surface blastSurface = mBlastBufferQueue.createSurface();
+    mSurface.transferFrom(blastSurface);
+}
+
+```
+
+注释36会先创建BLASTBufferQueue，再在注释37处通过执行其createSurface来创建Surface。我们先看BLASTBufferQueue的构造函数
+
+> frameworks/base/graphics/java/android/graphics/BLASTBufferQueue.java
+
+```java
+/** Create a new connection with the surface flinger. */
+public BLASTBufferQueue(String name, SurfaceControl sc, int width, int height,
+                        @PixelFormat.Format int format) {
+    this(name, true /* updateDestinationFrame */);
+    update(sc, width, height, format);
+}
+
+public BLASTBufferQueue(String name, boolean updateDestinationFrame) {
+    mNativeObject = nativeCreate(name, updateDestinationFrame);
+}
+```
+
+通过JNI创建了BLASTBufferQueue
+
+> frameworks/base/core/jni/android_graphics_BLASTBufferQueue.cpp
+
+```cpp
+static jlong nativeCreate(JNIEnv* env, jclass clazz, jstring jName,
+                          jboolean updateDestinationFrame) {
+    ScopedUtfChars name(env, jName);
+    //直接new了BLASTBufferQueue并返回其地址
+    sp<BLASTBufferQueue> queue = new BLASTBufferQueue(name.c_str(), updateDestinationFrame);
+    queue->incStrong((void*)nativeCreate);
+    return reinterpret_cast<jlong>(queue.get());
+}
+```
+
+这里直接new了BLASTBufferQueue并返回其地址
+
+> frameworks/native/libs/gui/BLASTBufferQueue.cpp
+
+```cpp
+sp<IGraphicBufferConsumer> mConsumer;
+sp<IGraphicBufferProducer> mProducer;
+BLASTBufferQueue::BLASTBufferQueue(const std::string& name, bool updateDestinationFrame)
+    : mSurfaceControl(nullptr),
+mSize(1, 1),
+mRequestedSize(mSize),
+mFormat(PIXEL_FORMAT_RGBA_8888),
+mTransactionReadyCallback(nullptr),
+mSyncTransaction(nullptr),
+mUpdateDestinationFrame(updateDestinationFrame) {
+    if (name.find("SurfaceView") != std::string::npos) {
+        sLayerName = name;
+        pthread_once(&sCheckAppTypeOnce, initAppType);
+    }
+    //37 创建BufferQueue
+    createBufferQueue(&mProducer, &mConsumer);
+    // since the adapter is in the client process, set dequeue timeout
+    // explicitly so that dequeueBuffer will block
+    mProducer->setDequeueTimeout(std::numeric_limits<int64_t>::max());
+
+    // safe default, most producers are expected to override this
+    //设置生产者执行一次dequeue可以获得的最大缓冲区数为2
+    mProducer->setMaxDequeuedBufferCount(2);
+    mBufferItemConsumer = new BLASTBufferItemConsumer(mConsumer,
+                                                      GraphicBuffer::USAGE_HW_COMPOSER |
+                                                      GraphicBuffer::USAGE_HW_TEXTURE,
+                                                      1, false, this);
+    static int32_t id = 0;
+    mName = name + "#" + std::to_string(id);
+    auto consumerName = mName + "(BLAST Consumer)" + std::to_string(id);
+    mQueuedBufferTrace = "QueuedBuffer - " + mName + "BLAST#" + std::to_string(id);
+    id++;
+    mBufferItemConsumer->setName(String8(consumerName.c_str()));
+    // 设置当一个新的帧变为可用后会被通知的监听器对象。
+    mBufferItemConsumer->setFrameAvailableListener(this);
+    // 设置当一个旧的缓冲区被释放后会被通知的监听器对象为自己
+    mBufferItemConsumer->setBufferFreedListener(this);
+
+    // ComposerService::getComposerService()即拿到SF,这里获取的缓冲区的数量。  
+    ComposerService::getComposerService()->getMaxAcquiredBufferCount(&mMaxAcquiredBuffers);
+    //设置消费者可以一次获取的缓冲区的最大值，默认为1
+    mBufferItemConsumer->setMaxAcquiredBufferCount(mMaxAcquiredBuffers);
+    mCurrentMaxAcquiredBufferCount = mMaxAcquiredBuffers;
+
+    //...
+}
+```
+
+BLASTBufferQueue的构造函数注释37处通过createBufferQueue创建BufferQueue，传进去的mProducer和mConsumer即是IGraphicBufferProducer和IGraphicBufferConsumer类型
+
+```cpp
+void BLASTBufferQueue::createBufferQueue(sp<IGraphicBufferProducer>* outProducer,
+                                         sp<IGraphicBufferConsumer>* outConsumer) {
+    //38 先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer
+    sp<BufferQueueCore> core(new BufferQueueCore());
+    sp<IGraphicBufferProducer> producer(new BBQBufferQueueProducer(core));
+
+    sp<BufferQueueConsumer> consumer(new BufferQueueConsumer(core));
+    consumer->setAllowExtraAcquire(true);
+
+    *outProducer = producer;
+    *outConsumer = consumer;
+}
+```
+
+注释38会先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer，再赋值给传进来的outProducer和outConsumer
