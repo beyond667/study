@@ -1473,6 +1473,7 @@ mUpdateDestinationFrame(updateDestinationFrame) {
     // safe default, most producers are expected to override this
     //设置生产者执行一次dequeue可以获得的最大缓冲区数为2
     mProducer->setMaxDequeuedBufferCount(2);
+    //38 把mConsumer包装到BLASTBufferItemConsumer，并为其设置缓冲区被释放后的监听为自己（即BLASTBufferQueue）
     mBufferItemConsumer = new BLASTBufferItemConsumer(mConsumer,
                                                       GraphicBuffer::USAGE_HW_COMPOSER |
                                                       GraphicBuffer::USAGE_HW_TEXTURE,
@@ -1498,12 +1499,12 @@ mUpdateDestinationFrame(updateDestinationFrame) {
 }
 ```
 
-BLASTBufferQueue的构造函数注释37处通过createBufferQueue创建BufferQueue，传进去的mProducer和mConsumer即是IGraphicBufferProducer和IGraphicBufferConsumer类型
+BLASTBufferQueue的构造函数注释37处通过createBufferQueue创建BufferQueue，传进去的mProducer和mConsumer即是IGraphicBufferProducer和IGraphicBufferConsumer类型，然后在注释38处为mConsumer包装成BLASTBufferItemConsumer，并为其设置监听。先看注释37处createBufferQueue
 
 ```cpp
 void BLASTBufferQueue::createBufferQueue(sp<IGraphicBufferProducer>* outProducer,
                                          sp<IGraphicBufferConsumer>* outConsumer) {
-    //38 先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer
+    //39 先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer
     sp<BufferQueueCore> core(new BufferQueueCore());
     sp<IGraphicBufferProducer> producer(new BBQBufferQueueProducer(core));
 
@@ -1515,4 +1516,4 @@ void BLASTBufferQueue::createBufferQueue(sp<IGraphicBufferProducer>* outProducer
 }
 ```
 
-注释38会先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer，再赋值给传进来的outProducer和outConsumer
+注释39会先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer，再赋值给传进来的outProducer和outConsumer。注意，此时是在客户端的进程中创建的BufferQueue的生产者和消费者。
