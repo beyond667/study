@@ -1371,7 +1371,7 @@ handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址�
 + WMS进程relayoutWindow里会先拿之前创建的WindowState判断是否要重新布局，需要的话就创建个WindowSurfaceController对象，在其构造函数中会基于构建者模式创建SurfaceControl，SurfaceControl的构造函数会通过JNI去创建SurfaceControl。如果JNI创建成功，就会把SurfaceControl数据拷贝到客户端传进来的对象里。
 + 再看JNI创建SurfaceControl的过程，此时还在wms进程，会先通过之前与SF创建连接时拿到的SurfaceComposerClient调用SF进程Client服务端的createSurfaceChecked方法，其会调用SF的createLayer，主要先根据不同的surface类型创建不同的layer，大部分情况下都是创建BufferStateLayer，然后再通过layer.getHandle获取一个Binder对象，此方法只在创建layer时调用一次，再次调用会返回空。此Handle主要是存到给WMS进程返回的SurfaceControl中，以供WMS通过Handle来操作具体的layer
 
-##### Surface的初始化
+##### Surface的初始化-创建BLASTBufferQueue
 
 上一小节中，客户端和WMS内部的SurfaceControl都已关联了SF创建的SurfaceControl的地址，还有handle的代理对象的地址。我们继续看ViewRootImpl.relayoutWindow后面的流程注释16处 
 
@@ -1464,7 +1464,7 @@ mUpdateDestinationFrame(updateDestinationFrame) {
         sLayerName = name;
         pthread_once(&sCheckAppTypeOnce, initAppType);
     }
-    //37 创建BufferQueue
+    //38 创建BufferQueue
     createBufferQueue(&mProducer, &mConsumer);
     // since the adapter is in the client process, set dequeue timeout
     // explicitly so that dequeueBuffer will block
@@ -1473,7 +1473,7 @@ mUpdateDestinationFrame(updateDestinationFrame) {
     // safe default, most producers are expected to override this
     //设置生产者执行一次dequeue可以获得的最大缓冲区数为2
     mProducer->setMaxDequeuedBufferCount(2);
-    //38 把mConsumer包装到BLASTBufferItemConsumer，并为其设置缓冲区被释放后的监听为自己（即BLASTBufferQueue）
+    //39 把mConsumer包装到BLASTBufferItemConsumer，并为其设置缓冲区被释放后的监听为自己（即BLASTBufferQueue）
     mBufferItemConsumer = new BLASTBufferItemConsumer(mConsumer,
                                                       GraphicBuffer::USAGE_HW_COMPOSER |
                                                       GraphicBuffer::USAGE_HW_TEXTURE,
@@ -1499,12 +1499,12 @@ mUpdateDestinationFrame(updateDestinationFrame) {
 }
 ```
 
-BLASTBufferQueue的构造函数注释37处通过createBufferQueue创建BufferQueue，传进去的mProducer和mConsumer即是IGraphicBufferProducer和IGraphicBufferConsumer类型，然后在注释38处为mConsumer包装成BLASTBufferItemConsumer，并为其设置监听。先看注释37处createBufferQueue
+BLASTBufferQueue的构造函数注释38处通过createBufferQueue创建BufferQueue，传进去的mProducer和mConsumer即是IGraphicBufferProducer和IGraphicBufferConsumer类型，然后在注释39处为mConsumer包装成BLASTBufferItemConsumer，并为其设置监听。先看注释38处createBufferQueue
 
 ```cpp
 void BLASTBufferQueue::createBufferQueue(sp<IGraphicBufferProducer>* outProducer,
                                          sp<IGraphicBufferConsumer>* outConsumer) {
-    //39 先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer
+    //40 先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer
     sp<BufferQueueCore> core(new BufferQueueCore());
     sp<IGraphicBufferProducer> producer(new BBQBufferQueueProducer(core));
 
@@ -1516,4 +1516,102 @@ void BLASTBufferQueue::createBufferQueue(sp<IGraphicBufferProducer>* outProducer
 }
 ```
 
-注释39会先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer，再赋值给传进来的outProducer和outConsumer。注意，此时是在客户端的进程中创建的BufferQueue的生产者和消费者。
+注释40会先创建BufferQueueCore，再根据创建的BufferQueueCore创建BBQBufferQueueProducer和BufferQueueConsumer，再赋值给传进来的outProducer和outConsumer。注意，此时是在客户端的进程中创建的BufferQueue的生产者和消费者。再看注释39处创建BLASTBufferItemConsumer
+
+```c++
+//BufferItemConsumer.cpp
+BufferItemConsumer::BufferItemConsumer(
+        const sp<IGraphicBufferConsumer>& consumer, uint64_t consumerUsage,
+        int bufferCount, bool controlledByApp) :
+    ConsumerBase(consumer, controlledByApp)
+{
+    status_t err = mConsumer->setConsumerUsageBits(consumerUsage);
+    if (bufferCount != DEFAULT_MAX_BUFFERS) {
+        err = mConsumer->setMaxAcquiredBufferCount(bufferCount);
+    }
+}
+
+//BufferItemConsumer.h
+//BufferItemConsumer继承于ConsumerBase，调用BufferItemConsumer的构造函数时也会调用ConsumerBase的构造函数
+class BufferItemConsumer: public ConsumerBase{}
+
+//ConsumerBase.h
+//ConsumerBase继承于ConsumerListener
+class ConsumerBase : public virtual RefBase,protected ConsumerListener{}
+            
+//ConsumerBase.cpp
+ConsumerBase::ConsumerBase(const sp<IGraphicBufferConsumer>& bufferQueue, bool controlledByApp) :
+        mAbandoned(false),
+        mConsumer(bufferQueue),
+        mPrevFinalReleaseFence(Fence::NO_FENCE) {
+    mName = String8::format("unnamed-%d-%d", getpid(), createProcessUniqueId());
+
+    wp<ConsumerListener> listener = static_cast<ConsumerListener*>(this);
+    sp<IConsumerListener> proxy = new BufferQueue::ProxyConsumerListener(listener);
+
+    //把mConsumer关联到BufferItemConsumer
+    status_t err = mConsumer->consumerConnect(proxy, controlledByApp);
+            mConsumer->setConsumerName(mName);
+}
+
+//BufferQueueConsumer.h
+virtual status_t consumerConnect(const sp<IConsumerListener>& consumer,bool controlledByApp) {
+    return connect(consumer, controlledByApp);
+}
+
+//BufferQueueConsumer.cpp
+status_t BufferQueueConsumer::connect(
+        const sp<IConsumerListener>& consumerListener, bool controlledByApp) {
+	//...
+    //41 BufferQueueConsumer里的mCore.mConsumerListener也记录BufferItemConsumer
+    mCore->mConsumerListener = consumerListener;
+    mCore->mConsumerControlledByApp = controlledByApp;
+    return NO_ERROR;
+}
+```
+
+在注释41处把BufferQueueConsumer里的mCore.mConsumerListener也记录BufferItemConsumer，mCore即创建BufferQueueConsumer时传进来的BufferQueueCore，这样就完成了BLASTBufferItemConsumer到BufferQueue的连接。这个过程其实就是准备了BBQBufferQueueProducer和BufferQueueConsumer（被包装到BLASTBufferItemConsumer里）
+
+##### Surface的初始化-创建Surface
+
+我们继续看注释37 执行BLASTBufferQueue的createSurface来创建Surface的过程
+
+```java
+//BLASTBufferQueue.java
+public long mNativeObject; // BLASTBufferQueue*
+private static native Surface nativeGetSurface(long ptr, boolean includeSurfaceControlHandle);
+public Surface createSurface() {
+    return nativeGetSurface(mNativeObject, false /* includeSurfaceControlHandle */);
+}
+```
+
+通过上一小节创建的BLASTBufferQueue去创建JNI层的Surface
+
+> frameworks/base/core/jni/android_graphics_BLASTBufferQueue.cpp
+
+```cpp
+static jobject nativeGetSurface(JNIEnv* env, jclass clazz, jlong ptr,
+                                jboolean includeSurfaceControlHandle) {
+    sp<BLASTBufferQueue> queue = reinterpret_cast<BLASTBufferQueue*>(ptr);
+    return android_view_Surface_createFromSurface(env,queue->getSurface(includeSurfaceControlHandle));
+}
+
+//android_view_Surface.cpp
+jobject android_view_Surface_createFromSurface(JNIEnv* env, const sp<Surface>& surface) {
+    //通过调用java层的构造函数创建Surface
+    jobject surfaceObj = env->NewObject(gSurfaceClassInfo.clazz,
+            gSurfaceClassInfo.ctor, (jlong)surface.get());
+    if (surfaceObj == NULL) {
+        return NULL;
+    }
+    surface->incStrong(&sRefBaseOwner);
+    return surfaceObj;
+}
+```
+
+
+
+```cpp
+
+```
+
