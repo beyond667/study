@@ -1572,7 +1572,7 @@ status_t BufferQueueConsumer::connect(
 
 在注释41处把BufferQueueConsumer里的mCore.mConsumerListener也记录BufferItemConsumer，mCore即创建BufferQueueConsumer时传进来的BufferQueueCore，这样就完成了BLASTBufferItemConsumer到BufferQueue的连接。这个过程其实就是准备了BBQBufferQueueProducer和BufferQueueConsumer（被包装到BLASTBufferItemConsumer里）
 
-##### Surface的初始化-创建Surface
+##### Surface的初始化-客户端创建Surface
 
 我们继续看注释37 执行BLASTBufferQueue的createSurface来创建Surface的过程
 
@@ -1585,7 +1585,7 @@ public Surface createSurface() {
 }
 ```
 
-通过上一小节创建的BLASTBufferQueue去创建JNI层的Surface
+通过上一小节创建的BLASTBufferQueue去创建JNI层的Surface，注意传的includeSurfaceControlHandle 为false
 
 > frameworks/base/core/jni/android_graphics_BLASTBufferQueue.cpp
 
@@ -1593,12 +1593,24 @@ public Surface createSurface() {
 static jobject nativeGetSurface(JNIEnv* env, jclass clazz, jlong ptr,
                                 jboolean includeSurfaceControlHandle) {
     sp<BLASTBufferQueue> queue = reinterpret_cast<BLASTBufferQueue*>(ptr);
+    //先通过queue->getSurface获取Surface，再通过android_view_Surface_createFromSurface调用java层的构造函数来创建java层的Surface
     return android_view_Surface_createFromSurface(env,queue->getSurface(includeSurfaceControlHandle));
+}
+
+sp<Surface> BLASTBufferQueue::getSurface(bool includeSurfaceControlHandle) {
+    std::unique_lock _lock{mMutex};
+    sp<IBinder> scHandle = nullptr;
+    //includeSurfaceControlHandle传的是false，所以scHandle为空
+    if (includeSurfaceControlHandle && mSurfaceControl) {
+        scHandle = mSurfaceControl->getHandle();
+    }
+    //42 JNI层创建BBQSurface,传的scHandle为空
+    return new BBQSurface(mProducer, true, scHandle, this);
 }
 
 //android_view_Surface.cpp
 jobject android_view_Surface_createFromSurface(JNIEnv* env, const sp<Surface>& surface) {
-    //通过调用java层的构造函数创建Surface
+    //43通过调用java层的构造函数创建java层的Surface，这里传了BBQSurface的地址，所以调用的是Surface.java的带long类型的构造函数
     jobject surfaceObj = env->NewObject(gSurfaceClassInfo.clazz,
             gSurfaceClassInfo.ctor, (jlong)surface.get());
     if (surfaceObj == NULL) {
@@ -1607,11 +1619,66 @@ jobject android_view_Surface_createFromSurface(JNIEnv* env, const sp<Surface>& s
     surface->incStrong(&sRefBaseOwner);
     return surfaceObj;
 }
+//env->NewObject里传的gSurfaceClassInfo.ctor即java层Surface.java的构造函数
+jclass clazz = FindClassOrDie(env, "android/view/Surface");
+gSurfaceClassInfo.ctor = GetMethodIDOrDie(env, gSurfaceClassInfo.clazz, "<init>", "(J)V");
+
+//Surface.java
+private Surface(long nativeObject) {
+    synchronized (mLock) {
+        setNativeObjectLocked(nativeObject);
+    }
+}
+private void setNativeObjectLocked(long ptr) {
+    //记录JNI层传过来的BBQSurface的地址
+    if (mNativeObject != ptr) {
+        //...
+        mNativeObject = ptr;
+    }
+}
 ```
 
-
+可以看到注释42返回给JNI层创建的是BBQSurface，构建BBQSurface时传进来了mProducer和BLASTBufferQueue，然后在注释43处通过调用java端Surface.java带long类型的构造函数，记录了JNI层创建的BBQSurface的地址。到这里我们需理解下Surface到底是什么。
 
 ```cpp
+//BLASTBufferQueue.cpp
+class BBQSurface : public Surface {
+    sp<BLASTBufferQueue> mBbq;
+    BBQSurface(const sp<IGraphicBufferProducer>& igbp, bool controlledByApp,
+               const sp<IBinder>& scHandle, const sp<BLASTBufferQueue>& bbq)
+          : Surface(igbp, controlledByApp, scHandle), mBbq(bbq) {}
+}
 
+//Surface.h
+class Surface : public ANativeObjectBase<ANativeWindow, Surface, RefBase>{}
+
+//ANativeObjectBase.h
+template <typename NATIVE_TYPE, typename TYPE, typename REF,
+        typename NATIVE_BASE = android_native_base_t>
+//ANativeObjectBase继承于模版定义的NATIVE_TYPE，即传进来的ANativeWindow
+class ANativeObjectBase : public NATIVE_TYPE, public REF{}
 ```
+
+可以看到Surface本质就是个ANativeWindow。根据其构造函数传的IGraphicBufferProducer和BufferQueue可以猜测其主要是通过图形缓冲区生产者（IGraphicBufferProducer）往BufferQueue里先获取buffer，再把buffer返回给BufferQueue，以供消费者消费，这里的生产者是客户端，消费者是SF。到这里，客户端已经创建好了BBQSurface，我们继续看绘制流程。
+
+##### 绘制流程
+
+在ViewRootImpl执行完relayoutWindow后，此时本地已经获取到了BBQSurface，但是此时还没从BufferQueue里拿Buffer，下面就分析下客户端作为生产者的流程。
+
+```java
+private void performTraversals() {
+	//...
+    relayoutResult = relayoutWindow(params, viewVisibility, insetsPending);
+    //...省略具体View绘制流程
+    performMeasure();
+    performLayout();
+    performDraw();
+}
+```
+
+
+
+
+
+
 
