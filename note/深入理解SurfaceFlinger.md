@@ -1674,11 +1674,390 @@ private void performTraversals() {
     performLayout();
     performDraw();
 }
+private boolean performDraw() {
+    //...
+    boolean canUseAsync = draw(fullRedrawNeeded, usingAsyncReport && mSyncBuffer);
+    //...
+}
+private boolean draw(boolean fullRedrawNeeded, boolean forceDraw) {
+    //...
+    if (isHardwareEnabled()) {
+		//...通过硬件加速的方式
+         mAttachInfo.mThreadedRenderer.draw(mView, mAttachInfo, this);
+    }else{
+        //...
+        //不使用硬件加速，即使用cpu绘制
+        if (!drawSoftware(surface, mAttachInfo, xOffset, yOffset,
+                          scalingRequired, dirty, surfaceInsets)) {
+            return false;
+        }
+    }
+   
+}
 ```
 
+在客户端绘制流程的draw的最后，调用了drawSoftware，目前只分析用cpu绘制，暂不考虑硬件加速
+
+```java
+private boolean drawSoftware(Surface surface, AttachInfo attachInfo, int xoff, int yoff,
+                             boolean scalingRequired, Rect dirty, Rect surfaceInsets) {
+	//...
+    //43 获取canvas,dirty是绘制区域,一般而言需要更新的childview或者整块contentview显示区域
+    canvas = mSurface.lockCanvas(dirty);
+    //...
+    //最终调用到view.onDraw方法
+    mView.draw(canvas);
+    //...
+    //44 释放并post canvas
+    surface.unlockCanvasAndPost(canvas);
+    //...
+}
+```
+
+我们知道view绘制的时候需要canvas，而canvas是通过注释43处surface.lockCanvas来获取。绘制过程可以简单描述为以下3步：  
+
++ 通过Surface获取一个有效的Canvas
++ view通过canvas进行绘制
++ Surface释放并发送此canvas
+
+我们再看下这3个步骤，先看
+
+```java
+//Surface.java
+private final Canvas mCanvas = new CompatibleCanvas();
+long mNativeObject;//Surface的内存地址
+private long mLockedObject;//JNI层新锁的Surface的内存地址
+public Canvas lockCanvas(Rect inOutDirty)
+    throws Surface.OutOfResourcesException, IllegalArgumentException {
+    synchronized (mLock) {
+        //45 native层锁Canvas，即锁一块内存区域
+        mLockedObject = nativeLockCanvas(mNativeObject, mCanvas, inOutDirty);
+        return mCanvas;
+    }
+}
+
+//Canvas.java
+public class Canvas extends BaseCanvas {
+    //此成员变量在父类BaseCanvas里定义
+    protected long mNativeCanvasWrapper;
+    public Canvas() {
+        if (!isHardwareAccelerated()) {
+            // 0 means no native bitmap
+            //46 JNI层创建native层的canvas并返回其内存地址
+            mNativeCanvasWrapper = nInitRaster(0);
+            mFinalizer = NoImagePreloadHolder.sRegistry.registerNativeAllocation(
+                this, mNativeCanvasWrapper);
+        } else {
+            mFinalizer = null;
+        }
+    }
+}
+```
+
+在注释45处native层锁Canvas时传了本地直接new的CompatibleCanvas，CompatibleCanvas继承于Canvas，Canvas的构造函数中会通过注释46在jni层创建native层的Canvas并返回其地址，我们先看注释46的nInitRaster
+
+> frameworks/base/libs/hwui/jni/android_graphics_Canvas.cpp
+
+```cpp
+static const JNINativeMethod gMethods[] = {
+    //...nInitRaster方法映射为initRaster
+    {"nInitRaster", "(J)J", (void*) CanvasJNI::initRaster},
+    //...
+}
+static jlong initRaster(JNIEnv* env, jobject, jlong bitmapHandle) {
+    SkBitmap bitmap;
+    //传过来的bitmapHandle为0，所以此时创建的bitmap为空
+    if (bitmapHandle != 0) {
+        bitmap::toBitmap(bitmapHandle).getSkBitmap(&bitmap);
+    }
+    return reinterpret_cast<jlong>(Canvas::create_canvas(bitmap));
+}
+
+// frameworks/base/libs/hwui/SkiaCanvas.cpp
+Canvas* Canvas::create_canvas(const SkBitmap& bitmap) {
+    return new SkiaCanvas(bitmap);
+}
+```
+
+在JNI层创建了SkiaCanvas。此时传入的SkBitmap是空的，没有任何有效信息。再看注释45处nativeLockCanvas
+
+> frameworks/base/core/jni/android_view_Surface.cpp
+
+```cpp
+static jlong nativeLockCanvas(JNIEnv* env, jclass clazz,
+                              jlong nativeObject, jobject canvasObj, jobject dirtyRectObj) {
+    // 获取对应native层的SUrface对象
+    sp<Surface> surface(reinterpret_cast<Surface *>(nativeObject));
+    //...获取绘制区域的左上右下
+    Rect dirtyRect(Rect::EMPTY_RECT);
+    Rect* dirtyRectPtr = NULL;
+    if (dirtyRectObj) {
+        dirtyRect.left   = env->GetIntField(dirtyRectObj, gRectClassInfo.left);
+        dirtyRect.top    = env->GetIntField(dirtyRectObj, gRectClassInfo.top);
+        dirtyRect.right  = env->GetIntField(dirtyRectObj, gRectClassInfo.right);
+        dirtyRect.bottom = env->GetIntField(dirtyRectObj, gRectClassInfo.bottom);
+        dirtyRectPtr = &dirtyRect;
+    }
+
+    ANativeWindow_Buffer buffer;
+    // 47 surface调用lock函数锁定一块buffer
+    status_t err = surface->lock(&buffer, dirtyRectPtr);
+    //...
+    //48 通过Java层的canvas对象初始化一个native层的canvas对象
+    graphics::Canvas canvas(env, canvasObj);
+    //49 设置buffer，然后canvas把buffer转换为SKBitmap
+    canvas.setBuffer(&buffer, static_cast<int32_t>(surface->getBuffersDataSpace()));
+    //...
+    // 创建一个新的Surface引用。返回到Java层
+    sp<Surface> lockedSurface(surface);
+    lockedSurface->incStrong(&sRefBaseOwner);
+    return (jlong) lockedSurface.get();
+}
+
+//frameworks/native/libs/nativewindow/include/android/native_window.h
+typedef struct ANativeWindow_Buffer {
+    int32_t width;
+    int32_t height;
+    int32_t stride;
+    int32_t format;
+    void* bits;
+    uint32_t reserved[6];
+} ANativeWindow_Buffer;
+```
+
+nativeLockCanvas主要分了三步：
+
++ 注释47 申请并锁定一块内存
++ 注释48 获取native层的canvas对象
++ 注释49 把buffer设置进canvas
+
+先看注释47 surface->lock
+
+```cpp
+status_t Surface::lock(ANativeWindow_Buffer* outBuffer, ARect* inOutDirtyBounds){
+    ANativeWindowBuffer* out;
+    int fenceFd = -1;
+    //50 dequeueBuffer 从输入缓冲队列中获取一块内存
+    status_t err = dequeueBuffer(&out, &fenceFd);
+    if (err == NO_ERROR) {
+        //当前申请的图形内存区域作为backBuffer
+        sp<GraphicBuffer> backBuffer(GraphicBuffer::getSelf(out));
+        const Rect bounds(backBuffer->width, backBuffer->height);
+
+        Region newDirtyRegion;
+        if (inOutDirtyBounds) {
+            newDirtyRegion.set(static_cast<Rect const&>(*inOutDirtyBounds));
+            newDirtyRegion.andSelf(bounds);
+        } else {
+            newDirtyRegion.set(bounds);
+        }
+
+        // figure out if we can copy the frontbuffer back
+        // mPostedBuffer作为正在显示的一块图像区域
+        const sp<GraphicBuffer>& frontBuffer(mPostedBuffer);
+        //其实这里就涉及到SUrface的双缓冲机制 mPostedBuffer/mLockedBuffer两块buffer
+        // 这里要判断是否可以复制（比较一下backBuffer与frontBuffer）
+        const bool canCopyBack = (frontBuffer != nullptr &&
+                                  backBuffer->width  == frontBuffer->width &&
+                                  backBuffer->height == frontBuffer->height &&
+                                  backBuffer->format == frontBuffer->format);
+
+        if (canCopyBack) { // 可以赋值时
+            //计算一下不需要重绘的区域
+            const Region copyback(mDirtyRegion.subtract(newDirtyRegion));
+            if (!copyback.isEmpty()) {
+                // 复制不需要重绘的区域
+                copyBlt(backBuffer, frontBuffer, copyback, &fenceFd);
+            }
+        } else {
+            // 设置脏区域的边界
+            newDirtyRegion.set(bounds);
+            //不能复制则清理一下原先的数据
+            mDirtyRegion.clear();
+            Mutex::Autolock lock(mMutex);
+            for (size_t i=0 ; i<NUM_BUFFER_SLOTS ; i++) {
+                mSlots[i].dirtyRegion.clear();
+            }
+        }
+        //...
+        // 锁定后缓冲区
+        status_t res = backBuffer->lockAsync(
+            GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN,
+            newDirtyRegion.bounds(), &vaddr, fenceFd);
 
 
+        if (res != 0) {
+            err = INVALID_OPERATION;
+        } else {
+            //申请的这块backBuffer保存为mLockedBuffer
+            mLockedBuffer = backBuffer;
+            outBuffer->width  = backBuffer->width;
+            outBuffer->height = backBuffer->height;
+            outBuffer->stride = backBuffer->stride;
+            outBuffer->format = backBuffer->format;
+            outBuffer->bits   = vaddr;
+        }
+    }
+    return err;
+}
+int Surface::dequeueBuffer(android_native_buffer_t** buffer, int* fenceFd) {
+    //...mGraphicBufferProducer是在Surface构造函数中赋值的
+    status_t result = mGraphicBufferProducer->dequeueBuffer(&buf, &fence, dqInput.width,
+                                                            dqInput.height, dqInput.format,
+                                                            dqInput.usage, &mBufferAge,
+                                                            dqInput.getTimestamps ?
+                                                            &frameTimestamps : nullptr);
+    //...
+}
+```
 
+注释50处先dequeueBuffer从输入缓冲队列中获取一块内存，这里牵涉到Surface的双缓冲机制，即前后缓冲区，正在显示的作为前缓冲区，在后台准备新的数据的为后缓冲区。这里会先拿前缓冲区与后缓冲区的参数（宽高，format）判断是否可以直接复制，然后锁定后缓冲区。
 
+再看注释48获取native层的Canvas
 
+```c++
+//frameworks/base/libs/hwui/apex/include/android/graphics/canvas.h
+namespace graphics {
+    class Canvas {
+        public:
+        Canvas(JNIEnv* env, jobject canvasObj) :
+        // 调用ACanvas_getNativeHandleFromJava
+        mCanvas(ACanvas_getNativeHandleFromJava(env, canvasObj)),
+        mOwnedPtr(false) {}
+    }
+}
 
+//frameworks/base/libs/hwui/apex/android_canvas.cpp
+ACanvas* ACanvas_getNativeHandleFromJava(JNIEnv* env, jobject canvasObj) {
+    //继续调用getNativeCanvas
+    return TypeCast::toACanvas(GraphicsJNI::getNativeCanvas(env, canvasObj));
+}
+
+//frameworks/base/libs/hwui/jni/Graphics.cpp
+android::Canvas* GraphicsJNI::getNativeCanvas(JNIEnv* env, jobject canvas) {
+    //...
+    //51 获取Java层的Canvas mNativeCanvasWrapper的句柄
+    jlong canvasHandle = env->GetLongField(canvas, gCanvas_nativeInstanceID);
+    if (!canvasHandle) {
+        return NULL;
+    }
+    // 把数值转换为对象
+    return reinterpret_cast<android::Canvas*>(canvasHandle);
+}
+int register_android_graphics_Graphics(JNIEnv* env){
+    gCanvas_nativeInstanceID = GetFieldIDOrDie(env, gCanvas_class, "mNativeCanvasWrapper", "J");
+}
+```
+
+注释51处通过java层传过来的canvas对象获取mNativeCanvasWrapper的句柄（即SkiaCanvas）。
+
+再看注释49处canvas.Buffer
+
+```cpp
+//frameworks/base/libs/hwui/apex/include/android/graphics/canvas.h
+bool setBuffer(const ANativeWindow_Buffer* buffer,
+               int32_t /*android_dataspace_t*/ dataspace) {
+    return ACanvas_setBuffer(mCanvas, buffer, dataspace);
+}
+
+//frameworks/base/libs/hwui/apex/android_canvas.cpp
+bool ACanvas_setBuffer(ACanvas* canvas, const ANativeWindow_Buffer* buffer,
+                       int32_t /*android_dataspace_t*/ dataspace) {
+    SkBitmap bitmap;
+    //52 把buffer转换为SKBitmap
+    bool isValidBuffer = (buffer == nullptr) ? false : convert(buffer, dataspace, &bitmap);
+    // 然后把SKBitmap设置进SkiaCanvas中（SKBitmap可以被canvas绘制）
+    TypeCast::toCanvas(canvas)->setBitmap(bitmap);
+    return isValidBuffer;
+}
+
+//frameworks/base/libs/hwui/SkiaCanvas.cpp 
+void SkiaCanvas::setBitmap(const SkBitmap& bitmap) {
+    // 根据传入的bitmap创建一个SkCanvas，并更新
+    mCanvasOwned.reset(new SkCanvas(bitmap));
+    mCanvas = mCanvasOwned.get();
+
+    // clean up the old save stack
+    mSaveStack.reset(nullptr);
+}
+```
+
+注释52把获取的buffer转换为一个SkBitmap,此时bitmap中有有效信息，然后把此bitmap设置进SkiaCanvas并替换原来的Bitmap（SKBitmap可以被canvas绘制），接下来canvas就在这个bitmap上进行绘制。
+
+注释43处lockCanvas获取有效的Canvas结束后，下面mView.draw(canvas)过程不再细看，都会调用view的onDraw传入此canvas完成绘制，其实都是通过JNI层的SkiaCanvas绘制到SkBitmap上，这些都是通过skia图像绘制引擎具体实现，这里不再讨论。我们继续看绘制完之后注释44处释放并post此canvas
+
+```java
+public void unlockCanvasAndPost(Canvas canvas) {
+    synchronized (mLock) {
+        //暂不考虑硬件加速
+        if (mHwuiContext != null) {
+            mHwuiContext.unlockAndPost(canvas);
+        } else {
+            unlockSwCanvasAndPost(canvas);
+        }
+    }
+}
+
+private void unlockSwCanvasAndPost(Canvas canvas) {
+    //...
+    try {
+        nativeUnlockCanvasAndPost(mLockedObject, canvas);
+    } finally {
+        nativeRelease(mLockedObject);
+        mLockedObject = 0;
+    }
+}
+private static native void nativeUnlockCanvasAndPost(long nativeObject, Canvas canvas);
+```
+
+没什么好解释的，调用JNI的nativeUnlockCanvasAndPost
+
+```cpp
+//frameworks/base/core/jni/android_view_Surface.cpp
+static void nativeUnlockCanvasAndPost(JNIEnv* env, jclass clazz,
+        jlong nativeObject, jobject canvasObj) {
+    sp<Surface> surface(reinterpret_cast<Surface *>(nativeObject));
+    if (!isSurfaceValid(surface)) {
+        return;
+    }
+
+    // detach the canvas from the surface
+    //获取native层的SkiaCanvas
+    graphics::Canvas canvas(env, canvasObj);
+    //skiaCanvas设置buffer为空
+    canvas.setBuffer(nullptr, ADATASPACE_UNKNOWN);
+
+    // unlock surface
+    status_t err = surface->unlockAndPost();
+    if (err < 0) {
+        jniThrowException(env, IllegalArgumentException, NULL);
+    }
+}
+
+// frameworks/native/libs/gui/Surface.cpp
+status_t Surface::unlockAndPost()
+{
+    //surface->lock()时已经保存了一个mLockedBuffer，此时应该不为null
+    if (mLockedBuffer == nullptr) {
+        return INVALID_OPERATION;
+    }
+
+    int fd = -1;
+    // 解除锁定
+    status_t err = mLockedBuffer->unlockAsync(&fd);
+    //53 把这块绘制完毕的buffer提交到缓冲队列中，等待显示
+    err = queueBuffer(mLockedBuffer.get(), fd);
+    //...
+    // 接着这块buffer就变成了前台已发布的buffer了，这个就是双缓冲机制了
+    mPostedBuffer = mLockedBuffer;
+    //置空
+    mLockedBuffer = nullptr;
+    return err;
+}
+```
+
+注释53处Surface在unlockAndPost时调用queueBuffer把绘制完毕的buffer提交到缓冲队列，等待消费者消费后显示。  
+
+做个小结，ViewRootImpl通过Surface从缓冲队列获取一块可用于绘制的buffer，然后把buffer绑定到canvas中，View使用该canvas进行绘制，产生的渲染数据最终保存在buffer中，绘制完毕后，通过surface清除canvas与buffer的绑定关系，并把buffer发送到缓冲队列。此后再有消费者，大部分情况下是SurfaceFlinger进行消费，也有例外，比如也可以通过视频编码器进行消费。
+
+##### SurfaceFlinger消费Buffer
