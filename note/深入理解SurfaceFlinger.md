@@ -1037,7 +1037,7 @@ status_t SurfaceFlinger::createBufferStateLayer(LayerCreationArgs& args, sp<IBin
 }
 ```
 
-SurfaceFlinger创建layer的核心代码。
+SurfaceFlinger创建layer的流程。
 
 首先，根据不同的surface类型创建不同的layer，跟我们上面看到的4种surface类型一一对应。对于大部分应都是走注释28创建BufferStateLayer，其是通过注释29处getFactory().createBufferStateLayer来创建BufferStateLayer的。注释30在创建完layer后会通过addClientLayer来记录客户端的layer。
 
@@ -1371,14 +1371,14 @@ handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址�
 + WMS进程relayoutWindow里会先拿之前创建的WindowState判断是否要重新布局，需要的话就创建个WindowSurfaceController对象，在其构造函数中会基于构建者模式创建SurfaceControl，SurfaceControl的构造函数会通过JNI去创建SurfaceControl。如果JNI创建成功，就会把SurfaceControl数据拷贝到客户端传进来的对象里。
 + 再看JNI创建SurfaceControl的过程，此时还在wms进程，会先通过之前与SF创建连接时拿到的SurfaceComposerClient调用SF进程Client服务端的createSurfaceChecked方法，其会调用SF的createLayer，主要先根据不同的surface类型创建不同的layer，大部分情况下都是创建BufferStateLayer，然后再通过layer.getHandle获取一个Binder对象，此方法只在创建layer时调用一次，再次调用会返回空。此Handle主要是存到给WMS进程返回的SurfaceControl中，以供WMS通过Handle来操作具体的layer
 
-##### Surface的初始化-创建BLASTBufferQueue
+##### Surface的初始化-创建BLASTBufferQueue（BBQ）
 
-上一小节中，客户端和WMS内部的SurfaceControl都已关联了SF创建的SurfaceControl的地址，还有handle的代理对象的地址。我们继续看ViewRootImpl.relayoutWindow后面的流程注释16处 
+上一小节中，客户端和WMS内部的SurfaceControl都已关联了jni创建的SurfaceControl的地址，还有SF创建的layer代理对象handle的地址。我们继续看ViewRootImpl.relayoutWindow后面的流程注释16处 
 
 ```java
 //ViewRootImpl.relayoutWindow
 private int relayoutWindow(WindowManager.LayoutParams params...){
-    // 注释16 认情况下useBLAST都是返回true
+    // 注释16 默认情况下useBLAST都是返回true
     if (!useBLAST()) {
         mSurface.copyFrom(mSurfaceControl);
     } else {
@@ -1421,12 +1421,17 @@ void updateBlastSurfaceIfNeeded() {
 /** Create a new connection with the surface flinger. */
 public BLASTBufferQueue(String name, SurfaceControl sc, int width, int height,
                         @PixelFormat.Format int format) {
+    //JNI层先创建BLASTBufferQueue
     this(name, true /* updateDestinationFrame */);
+    //在把SurfaceControl关联进BLASTBufferQueue
     update(sc, width, height, format);
 }
 
 public BLASTBufferQueue(String name, boolean updateDestinationFrame) {
     mNativeObject = nativeCreate(name, updateDestinationFrame);
+}
+public void update(SurfaceControl sc, int width, int height, @PixelFormat.Format int format) {
+    nativeUpdate(mNativeObject, sc.mNativeObject, width, height, format);
 }
 ```
 
@@ -1659,7 +1664,7 @@ template <typename NATIVE_TYPE, typename TYPE, typename REF,
 class ANativeObjectBase : public NATIVE_TYPE, public REF{}
 ```
 
-可以看到Surface本质就是个ANativeWindow。根据其构造函数传的IGraphicBufferProducer和BufferQueue可以猜测其主要是通过图形缓冲区生产者（IGraphicBufferProducer）往BufferQueue里先获取buffer，再把buffer返回给BufferQueue，以供消费者消费，这里的生产者是客户端，消费者是SF。到这里，客户端已经创建好了BBQSurface，我们继续看绘制流程。
+可以看到Surface本质就是个ANativeWindow。根据其构造函数传的IGraphicBufferProducer和BufferQueue可以猜测其主要是通过图形缓冲区生产者（IGraphicBufferProducer）往BufferQueue里先获取buffer，再把buffer返回给BufferQueue，以供消费者消费，这里的生产者是客户端，当前的消费者是BLASTBufferQueue里包装了IGraphicBufferConsumer的BLASTBufferItemConsumer，其最终的消费者还是SF。到这里，客户端已经创建好了BBQSurface，我们继续看绘制流程。
 
 ##### 绘制流程
 
@@ -1754,7 +1759,7 @@ public class Canvas extends BaseCanvas {
 }
 ```
 
-在注释45处native层锁Canvas时传了本地直接new的CompatibleCanvas，CompatibleCanvas继承于Canvas，Canvas的构造函数中会通过注释46在jni层创建native层的Canvas并返回其地址，我们先看注释46的nInitRaster
+在注释45处native层锁Canvas时传了Surface类的成员变量即直接new的CompatibleCanvas，CompatibleCanvas继承于Canvas，Canvas的构造函数中会通过注释46在jni层创建native层的Canvas并返回其地址，我们先看注释46的nInitRaster
 
 > frameworks/base/libs/hwui/jni/android_graphics_Canvas.cpp
 
@@ -1951,7 +1956,7 @@ int register_android_graphics_Graphics(JNIEnv* env){
 
 注释51处通过java层传过来的canvas对象获取mNativeCanvasWrapper的句柄（即SkiaCanvas）。
 
-再看注释49处canvas.Buffer
+再看注释49处canvas.setBuffer
 
 ```cpp
 //frameworks/base/libs/hwui/apex/include/android/graphics/canvas.h
@@ -2058,6 +2063,6 @@ status_t Surface::unlockAndPost()
 
 注释53处Surface在unlockAndPost时调用queueBuffer把绘制完毕的buffer提交到缓冲队列，等待消费者消费后显示。  
 
-做个小结，ViewRootImpl通过Surface从缓冲队列获取一块可用于绘制的buffer，然后把buffer绑定到canvas中，View使用该canvas进行绘制，产生的渲染数据最终保存在buffer中，绘制完毕后，通过surface清除canvas与buffer的绑定关系，并把buffer发送到缓冲队列。此后再有消费者，大部分情况下是SurfaceFlinger进行消费，也有例外，比如也可以通过视频编码器进行消费。
+做个小结，ViewRootImpl通过Surface从缓冲队列获取一块可用于绘制的buffer，然后把buffer转换成SKBitmap后绑定到canvas中，View使用该canvas进行绘制，实际上就是绘制到SKBitmap中，即保存在buffer中，绘制完毕后，通过surface清除canvas与buffer的绑定关系，并把buffer发送到缓冲队列。此后再有消费者，大部分情况下是SurfaceFlinger进行消费，也有例外，比如也可以通过视频编码器进行消费。
 
 ##### SurfaceFlinger消费Buffer
