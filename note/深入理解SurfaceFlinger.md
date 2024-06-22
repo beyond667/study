@@ -1178,23 +1178,116 @@ void SurfaceFlinger::scheduleCommit(FrameHint hint) {
         mScheduler->resetIdleTimer();
     }
     notifyDisplayUpdateImminent();
+    //请求SurfaceFlinger的vsync
     mScheduler->scheduleFrame();
 }
-void SurfaceFlinger::notifyDisplayUpdateImminent() {
-    if (!mEarlyWakeUpEnabled) {
-        mPowerAdvisor->notifyDisplayUpdateImminent();
-        return;
-    }
-    #ifdef EARLY_WAKEUP_FEATURE
+
+//Scheduler.h
+class Scheduler : impl::MessageQueue {
+    using Impl = impl::MessageQueue;
+    public:
+    using Impl::scheduleFrame;
+}
+
+//MessageQueue.cpp
+void MessageQueue::scheduleFrame() {
+    //请求SurfaceFlinger的vsync
+    mVsync.scheduledFrameTime =
+        mVsync.registration->schedule({.workDuration = mVsync.workDuration.get().count(),
+                                       .readyDuration = 0,
+                                       .earliestVsync = mVsync.lastCallbackTime.count()});
+}
+
+//VSyncCallbackRegistration.cpp
+ScheduleResult VSyncCallbackRegistration::schedule(VSyncDispatch::ScheduleTiming scheduleTiming) {
+    // mDispatch 是 VSyncDispatchTimerQueue
+    return mDispatch.get().schedule(mToken, scheduleTiming);
+}
+
+//
+ScheduleResult VSyncDispatchTimerQueue::schedule(CallbackToken token,ScheduleTiming scheduleTiming) {
     //...
-    mDisplayExtnIntf->NotifyEarlyWakeUp(true, false);
-    #endif
+    //VSyncCallbackRegistration 构造的时候，调用registerCallback生成了一个 token ，这个token存储到了 map 对象 mCallbacks 现在拿出来
+    auto it = mCallbacks.find(token);
+     // map 迭代器 second 中存储 VSyncDispatchTimerQueueEntry
+    auto& callback = it->second;
+    // VSyncDispatchTimerQueueEntry 中存储真正的回调函数 MessageQueue::vsyncCallback
+    result = callback->schedule(scheduleTiming, mTracker, now);
+     //...
+}
+
+//在SurfaceFlinger初始化Scheduler时初始化了Vsync
+void SurfaceFlinger::initScheduler(const sp<DisplayDevice>& display) {
+    //...
+    mScheduler->initVsync(mScheduler->getVsyncDispatch(), *mFrameTimeline->getTokenManager(),
+                          configs.late.sfWorkDuration);
+    //...
+}
+
+//MessageQueue::initVsync
+void MessageQueue::initVsync(scheduler::VSyncDispatch& dispatch,
+                             frametimeline::TokenManager& tokenManager,
+                             std::chrono::nanoseconds workDuration) {
+    setDuration(workDuration);
+    mVsync.tokenManager = &tokenManager;
+    //初始化VSyncCallbackRegistration时设定callback为MessageQueue::vsyncCallback
+    mVsync.registration = std::make_unique<
+        scheduler::VSyncCallbackRegistration>(dispatch,
+                                              std::bind(&MessageQueue::vsyncCallback, this,
+                                                        std::placeholders::_1,
+                                                        std::placeholders::_2,
+                                                        std::placeholders::_3),"sf");
 }
 ```
 
-Android13上c++事务这块调用关系(由scheduleCommit到commit的过程)没完全看懂。  
+可以看到，VSyncDispatchTimerQueueEntry 中存储真正的回调函数是 MessageQueue::vsyncCallback，继续看MessageQueue::vsyncCallback
 
-不过既然是基于事务有提交scheduleCommit，就有处理的地方，最终会调用到其commit方法。
+```cpp
+//MessageQueue.cpp
+void MessageQueue::vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, nsecs_t readyTime) {
+    // Trace VSYNC-sf
+    mVsync.value = (mVsync.value + 1) % 2;
+    {
+        std::lock_guard lock(mVsync.mutex);
+        mVsync.lastCallbackTime = std::chrono::nanoseconds(vsyncTime);
+        mVsync.scheduledFrameTime.reset();
+    }
+
+    const auto vsyncId = mVsync.tokenManager->generateTokenForPredictions(
+            {targetWakeupTime, readyTime, vsyncTime});
+
+    mHandler->dispatchFrame(vsyncId, vsyncTime);
+}
+void MessageQueue::Handler::dispatchFrame(int64_t vsyncId, nsecs_t expectedVsyncTime) {
+    if (!mFramePending.exchange(true)) {
+        mVsyncId = vsyncId;
+        mExpectedVsyncTime = expectedVsyncTime;
+        //往mQueue.mLooper里发了消息
+        mQueue.mLooper->sendMessage(this, Message());
+    }
+}
+
+void MessageQueue::Handler::handleMessage(const Message&) {
+    mFramePending.store(false);
+
+    const nsecs_t frameTime = systemTime();
+     // mQueue  类型android::impl::MessageQueue
+    // android::impl::MessageQueue.mCompositor 类型 ICompositor
+    // SurfaceFlinger 继承 ICompositor
+    // mQueue.mCompositor 其实就是 SurfaceFlinger 
+    auto& compositor = mQueue.mCompositor;
+    
+    //调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite
+    if (!compositor.commit(frameTime, mVsyncId, mExpectedVsyncTime)) {
+        return;
+    }
+	//SF合成流程
+    compositor.composite(frameTime, mVsyncId);
+    compositor.sample();
+}
+```
+
+最终会调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite，commit和composite合成流程在本文后面再细看，这里先简单了解下
 
 ```cpp
 bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) FTL_FAKE_GUARD(kMainThreadContext) {
@@ -1489,9 +1582,9 @@ mUpdateDestinationFrame(updateDestinationFrame) {
     mQueuedBufferTrace = "QueuedBuffer - " + mName + "BLAST#" + std::to_string(id);
     id++;
     mBufferItemConsumer->setName(String8(consumerName.c_str()));
-    // 设置当一个新的帧变为可用后会被通知的监听器对象。
+    // 添加图形缓冲区可消费状态监听
     mBufferItemConsumer->setFrameAvailableListener(this);
-    // 设置当一个旧的缓冲区被释放后会被通知的监听器对象为自己
+    // 添加图形缓冲区可生产状态监听
     mBufferItemConsumer->setBufferFreedListener(this);
 
     // ComposerService::getComposerService()即拿到SF,这里获取的缓冲区的数量。  
@@ -2063,6 +2156,212 @@ status_t Surface::unlockAndPost()
 
 注释53处Surface在unlockAndPost时调用queueBuffer把绘制完毕的buffer提交到缓冲队列，等待消费者消费后显示。  
 
-做个小结，ViewRootImpl通过Surface从缓冲队列获取一块可用于绘制的buffer，然后把buffer转换成SKBitmap后绑定到canvas中，View使用该canvas进行绘制，实际上就是绘制到SKBitmap中，即保存在buffer中，绘制完毕后，通过surface清除canvas与buffer的绑定关系，并把buffer发送到缓冲队列。此后再有消费者，大部分情况下是SurfaceFlinger进行消费，也有例外，比如也可以通过视频编码器进行消费。
+做个小结，ViewRootImpl通过Surface的dequeueBuffer从缓冲队列获取一块可用于绘制的buffer，然后把buffer转换成SKBitmap后绑定到canvas中，View使用该canvas进行绘制，实际上就是绘制到SKBitmap中，即保存在buffer中，绘制完毕后，通过surface清除canvas与buffer的绑定关系，并通过queueBuffer把buffer发送到缓冲队列。此后再有消费者，大部分情况下是SurfaceFlinger进行消费，也有例外，比如也可以通过视频编码器进行消费。
 
-##### SurfaceFlinger消费Buffer
+##### 提交事务到SF
+
+上面注释53处调用Surface的queueBuffer把绘制完毕的buffer提交到缓冲队列中，我们继续看下是怎么通知到SF的
+
+```c++
+//Surface.cpp
+int Surface::queueBuffer(android_native_buffer_t* buffer, int fenceFd) {
+    //...
+    //调用绑定的GraphicBufferProducer.queueBuffer，即BufferQueueProducer
+    status_t err = mGraphicBufferProducer->queueBuffer(i, input, &output);
+}
+//BufferQueueProducer.cpp
+status_t BufferQueueProducer::queueBuffer(int slot,const QueueBufferInput &input, QueueBufferOutput *output) {
+    //...
+    sp<IConsumerListener> frameAvailableListener;
+    //...
+    //mCore->mConsumerListener即BLASTBufferQueue
+    frameAvailableListener = mCore->mConsumerListener;
+    //...
+    if (frameAvailableListener != nullptr) {
+        frameAvailableListener->onFrameAvailable(item);
+    }
+}
+//BLASTBufferQueue.cpp
+void BLASTBufferQueue::onFrameAvailable(const BufferItem& item) {
+    //...
+    bool waitForTransactionCallback = !mSyncedFrameNumbers.empty();
+    //...
+    if (!waitForTransactionCallback) {
+        acquireNextBufferLocked(std::nullopt);
+    }
+}
+
+void BLASTBufferQueue::acquireNextBufferLocked(const std::optional<SurfaceComposerClient::Transaction*> transaction) {
+    SurfaceComposerClient::Transaction localTransaction;
+    bool applyTransaction = true;
+    SurfaceComposerClient::Transaction* t = &localTransaction;
+    //...
+    //54 调用消费者的acquireBuffer从bufferqueue里取到传进去的空的BufferItem里
+    BufferItem bufferItem;
+    status_t status =mBufferItemConsumer->acquireBuffer(&bufferItem, 0 , false);
+    auto buffer = bufferItem.mGraphicBuffer;
+    
+    //55 把buffer设置到事务中，最终提交到SF
+    t->setBuffer(mSurfaceControl, buffer, fence, bufferItem.mFrameNumber, releaseBufferCallback);
+    t->setDataspace(mSurfaceControl, static_cast<ui::Dataspace>(bufferItem.mDataSpace));
+    t->setHdrMetadata(mSurfaceControl, bufferItem.mHdrMetadata);
+    t->setSurfaceDamageRegion(mSurfaceControl, bufferItem.mSurfaceDamage);
+    //56 设置了事务完成后的回调是自己，即BLASTBufferQueue
+    t->addTransactionCompletedCallback(transactionCallbackThunk, static_cast<void*>(this));
+    
+    mergePendingTransactions(t, bufferItem.mFrameNumber);
+    if (applyTransaction) {
+        if (sIsGame) {
+            t->setApplyToken(mApplyToken).apply(false, false);
+        } else {
+            // All transactions on our apply token are one-way. See comment on mAppliedLastTransaction
+            //57 所有的事务在applyToken都是单路的，即事务这里不会有回调
+            t->setApplyToken(mApplyToken).apply(false, true);
+        }
+        mAppliedLastTransaction = true;
+        mLastAppliedFrameNumber = bufferItem.mFrameNumber;
+    } 
+}
+```
+
+可以看到，生产者提交到缓冲队列后，实际上会回调BBQ的onFrameAvailable，在注释54处通过消费者的acquireBuffer从bufferqueue里取值并赋值到传进去空的BufferItem里，然后获取其mGraphicBuffer即buffer数据，并在注释55处把buffer数据设置到事务里，注释56处设置了事务完成后的回调为自己即BBQ，最后在注释56处应用此事务，即会调用到SF处理。  
+
+> 需要注意的是，Android12后google将BufferQueue组件从SF端移动到了客户端，带来的变化是整个生产者消费者模型都在客户端完成，即图形缓冲区的出队，入队，获取，释放等操作都在客户端，最终通过事务Transaction向SF提交Buffer等信息，Android12之前的消费者监听器是在SF端的ContentsChangedListener
+
+![流程图](img/surfaceFlinger-BBQ.webp)
+
+加上多个事务的合并提交到SF：
+![流程图](img/surfaceFlinger-事务.webp)
+
+
+我们继续看事务怎么传递到SF进程。
+
+注释57调用到了SurfaceComposerClient::Transaction::apply
+
+```c++
+//SurfaceComposerClient.cpp
+status_t SurfaceComposerClient::Transaction::apply(bool synchronous, bool oneWay) {
+    //获取SF代理对象
+    sp<ISurfaceComposer> sf(ComposerService::getComposerService());
+    
+    //新建个composerStates并把本地之前缓存的都添加进去
+    Vector<ComposerState> composerStates;
+    for (auto const& kv : mComposerStates){
+        composerStates.add(kv.second);
+    }
+	//...
+    //本地的binder对象传到SF，以便SF处理完后通知客户端事务已经完成
+    sp<IBinder> applyToken = mApplyToken
+        ? mApplyToken
+        : IInterface::asBinder(TransactionCompletedListener::getIInstance());
+
+    //58 调用SF.setTransactionState
+    sf->setTransactionState(mFrameTimelineInfo, composerStates, displayStates, flags, applyToken,
+                            mInputWindowCommands, mDesiredPresentTime, mIsAutoTimestamp,
+                            {} /*uncacheBuffer - only set in doUncacheBufferTransaction*/,
+                            hasListenerCallbacks, listenerCallbacks, mId);
+}
+```
+
+拿SF的代理对象，并把本地缓存的mComposerStates，事务完成后的监听的binder等数据通过注释58处调用setTransactionState来通知SF。我们先看下ComposerState数据即注释55处t.setBuffer的过程
+
+```c++
+SurfaceComposerClient::Transaction& SurfaceComposerClient::Transaction::setBuffer(
+    const sp<SurfaceControl>& sc, const sp<GraphicBuffer>& buffer,
+    const std::optional<sp<Fence>>& fence, const std::optional<uint64_t>& optFrameNumber,
+    ReleaseBufferCallback callback) {
+	//通过SurfaceControl获取layer_state_t
+    layer_state_t* s = getLayerState(sc);
+    
+    std::shared_ptr<BufferData> bufferData = std::make_shared<BufferData>();
+    bufferData->buffer = buffer;
+
+    s->what |= layer_state_t::eBufferChanged;
+    //59 buffer数据最终保存在layer_state_t.bufferData里
+    s->bufferData = std::move(bufferData);
+    //...
+    
+}
+layer_state_t* SurfaceComposerClient::Transaction::getLayerState(const sp<SurfaceControl>& sc) {
+    auto handle = sc->getLayerStateHandle();
+    return &(mComposerStates[handle].state);
+}
+//LayerState.h
+struct ComposerState {
+    layer_state_t state;
+    status_t write(Parcel& output) const;
+    status_t read(const Parcel& input);
+};
+```
+
+注释59其实buffer数据是保存在了ComposerState里面的layer_state_t里面的bufferData里。数据已经有了，我们继续看注释58处调用SF.setTransactionState
+
+```cpp
+//SurfaceFlinger.cpp
+status_t SurfaceFlinger::setTransactionState(
+    const FrameTimelineInfo& frameTimelineInfo, const Vector<ComposerState>& states,
+    const Vector<DisplayState>& displays, uint32_t flags, const sp<IBinder>& applyToken,
+    const InputWindowCommands& inputWindowCommands, int64_t desiredPresentTime,
+    bool isAutoTimestamp, const client_cache_t& uncacheBuffer, bool hasListenerCallbacks,
+    const std::vector<ListenerCallbacks>& listenerCallbacks, uint64_t transactionId) {
+	//...
+    IPCThreadState* ipc = IPCThreadState::self();
+    const int originPid = ipc->getCallingPid();
+    const int originUid = ipc->getCallingUid();
+    //根据参数构建个TransactionState
+    TransactionState state{frameTimelineInfo,  states,
+                           displays,           flags,
+                           applyToken,         inputWindowCommands,
+                           desiredPresentTime, isAutoTimestamp,
+                           uncacheBuffer,      postTime,
+                           permissions,        hasListenerCallbacks,
+                           listenerCallbacks,  originPid,
+                           originUid,          transactionId};
+	//把TransactionState入队列等待执行
+    queueTransaction(state);
+    if (state.transactionCommittedSignal) {
+        waitForSynchronousTransaction(*state.transactionCommittedSignal);
+    }
+
+    updateSmomoLayerInfo(state, desiredPresentTime, isAutoTimestamp);
+    return NO_ERROR;
+}
+void SurfaceFlinger::queueTransaction(TransactionState& state) {
+    //...
+    //TransactionState加到队列尾部
+    mTransactionQueue.emplace_back(state);
+    //...
+    //60 设置事务标记为eTransactionFlushNeeded即0x10
+    setTransactionFlags(eTransactionFlushNeeded, schedule, state.applyToken, frameHint);
+}
+```
+
+设置事务状态时构建个TransactionState并加入队列尾部，并设置事务标记为eTransactionFlushNeeded，关于SF设置标记后的流程上面已经看过了，但是handleMessage里commit和composite流程上文未细看
+
+```cpp
+void MessageQueue::Handler::handleMessage(const Message&) {
+    mFramePending.store(false);
+
+    const nsecs_t frameTime = systemTime();
+     // mQueue  类型android::impl::MessageQueue
+    // android::impl::MessageQueue.mCompositor 类型 ICompositor
+    // SurfaceFlinger 继承 ICompositor
+    // mQueue.mCompositor 其实就是 SurfaceFlinger 
+    auto& compositor = mQueue.mCompositor;
+    
+    //调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite
+    if (!compositor.commit(frameTime, mVsyncId, mExpectedVsyncTime)) {
+        return;
+    }
+    //SF合成流程
+    compositor.composite(frameTime, mVsyncId);
+    compositor.sample();
+}
+```
+
+下面细看下SF的提交合成流程。
+
+##### SF的commit和composite流程
+
+
+
