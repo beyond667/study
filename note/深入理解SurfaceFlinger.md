@@ -1163,269 +1163,8 @@ void Client::attachLayer(const sp<IBinder>& handle, const sp<Layer>& layer)
 
 + 注释31是SurfaceFlinger里的mCreatedLayers缓存了所有新创建的layer。
 + 注释32是Client里记录Handle和layer的关系。可以看到在Client.cpp里由成员变量mLayers记录。
-+ 注释33会通过改变事务的flag来触发SurfaceFlinger来管理此layer。需要注意的是Android11,12,13的实现均不完全一样，在Android13上是设置了事务的标记为eTransactionNeeded（0x01）
++ 注释33会通过改变事务的flag来触发SurfaceFlinger来管理此layer。需要注意的是Android11,12,13的实现均不完全一样，在Android13上是设置了事务的标记为eTransactionNeeded（0x01），事务的相关逻辑在后面提交事务到SF里详细讲。
 
-```c++
-void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule schedule,
-                                         const sp<IBinder>& applyToken, FrameHint frameHint) {
-    modulateVsync(&VsyncModulator::setTransactionSchedule, schedule, applyToken);
-    if (const bool scheduled = mTransactionFlags.fetch_or(mask) & mask; !scheduled) {
-        scheduleCommit(frameHint);
-    }
-}
-void SurfaceFlinger::scheduleCommit(FrameHint hint) {
-    if (hint == FrameHint::kActive) {
-        mScheduler->resetIdleTimer();
-    }
-    notifyDisplayUpdateImminent();
-    //请求SurfaceFlinger的vsync
-    mScheduler->scheduleFrame();
-}
-
-//Scheduler.h
-class Scheduler : impl::MessageQueue {
-    using Impl = impl::MessageQueue;
-    public:
-    using Impl::scheduleFrame;
-}
-
-//MessageQueue.cpp
-void MessageQueue::scheduleFrame() {
-    //请求SurfaceFlinger的vsync
-    mVsync.scheduledFrameTime =
-        mVsync.registration->schedule({.workDuration = mVsync.workDuration.get().count(),
-                                       .readyDuration = 0,
-                                       .earliestVsync = mVsync.lastCallbackTime.count()});
-}
-
-//VSyncCallbackRegistration.cpp
-ScheduleResult VSyncCallbackRegistration::schedule(VSyncDispatch::ScheduleTiming scheduleTiming) {
-    // mDispatch 是 VSyncDispatchTimerQueue
-    return mDispatch.get().schedule(mToken, scheduleTiming);
-}
-
-//
-ScheduleResult VSyncDispatchTimerQueue::schedule(CallbackToken token,ScheduleTiming scheduleTiming) {
-    //...
-    //VSyncCallbackRegistration 构造的时候，调用registerCallback生成了一个 token ，这个token存储到了 map 对象 mCallbacks 现在拿出来
-    auto it = mCallbacks.find(token);
-     // map 迭代器 second 中存储 VSyncDispatchTimerQueueEntry
-    auto& callback = it->second;
-    // VSyncDispatchTimerQueueEntry 中存储真正的回调函数 MessageQueue::vsyncCallback
-    result = callback->schedule(scheduleTiming, mTracker, now);
-     //...
-}
-
-//在SurfaceFlinger初始化Scheduler时初始化了Vsync
-void SurfaceFlinger::initScheduler(const sp<DisplayDevice>& display) {
-    //...
-    mScheduler->initVsync(mScheduler->getVsyncDispatch(), *mFrameTimeline->getTokenManager(),
-                          configs.late.sfWorkDuration);
-    //...
-}
-
-//MessageQueue::initVsync
-void MessageQueue::initVsync(scheduler::VSyncDispatch& dispatch,
-                             frametimeline::TokenManager& tokenManager,
-                             std::chrono::nanoseconds workDuration) {
-    setDuration(workDuration);
-    mVsync.tokenManager = &tokenManager;
-    //初始化VSyncCallbackRegistration时设定callback为MessageQueue::vsyncCallback
-    mVsync.registration = std::make_unique<
-        scheduler::VSyncCallbackRegistration>(dispatch,
-                                              std::bind(&MessageQueue::vsyncCallback, this,
-                                                        std::placeholders::_1,
-                                                        std::placeholders::_2,
-                                                        std::placeholders::_3),"sf");
-}
-```
-
-可以看到，VSyncDispatchTimerQueueEntry 中存储真正的回调函数是 MessageQueue::vsyncCallback，继续看MessageQueue::vsyncCallback
-
-```cpp
-//MessageQueue.cpp
-void MessageQueue::vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, nsecs_t readyTime) {
-    // Trace VSYNC-sf
-    mVsync.value = (mVsync.value + 1) % 2;
-    {
-        std::lock_guard lock(mVsync.mutex);
-        mVsync.lastCallbackTime = std::chrono::nanoseconds(vsyncTime);
-        mVsync.scheduledFrameTime.reset();
-    }
-
-    const auto vsyncId = mVsync.tokenManager->generateTokenForPredictions(
-            {targetWakeupTime, readyTime, vsyncTime});
-
-    mHandler->dispatchFrame(vsyncId, vsyncTime);
-}
-void MessageQueue::Handler::dispatchFrame(int64_t vsyncId, nsecs_t expectedVsyncTime) {
-    if (!mFramePending.exchange(true)) {
-        mVsyncId = vsyncId;
-        mExpectedVsyncTime = expectedVsyncTime;
-        //往mQueue.mLooper里发了消息
-        mQueue.mLooper->sendMessage(this, Message());
-    }
-}
-
-void MessageQueue::Handler::handleMessage(const Message&) {
-    mFramePending.store(false);
-
-    const nsecs_t frameTime = systemTime();
-     // mQueue  类型android::impl::MessageQueue
-    // android::impl::MessageQueue.mCompositor 类型 ICompositor
-    // SurfaceFlinger 继承 ICompositor
-    // mQueue.mCompositor 其实就是 SurfaceFlinger 
-    auto& compositor = mQueue.mCompositor;
-    
-    //调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite
-    if (!compositor.commit(frameTime, mVsyncId, mExpectedVsyncTime)) {
-        return;
-    }
-	//SF合成流程
-    compositor.composite(frameTime, mVsyncId);
-    compositor.sample();
-}
-```
-
-最终会调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite，commit和composite合成流程在本文后面再细看，这里先简单了解下
-
-```cpp
-bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) FTL_FAKE_GUARD(kMainThreadContext) {
-    //...这里只关注layer创建的事务
-    needsTraversal |= commitCreatedLayers();
-    needsTraversal |= flushTransactionQueues(vsyncId);
-    //...
-}
-bool SurfaceFlinger::commitCreatedLayers() {
-    std::vector<LayerCreatedState> createdLayers;
-    {
-        std::scoped_lock<std::mutex> lock(mCreatedLayersLock);
-        //先把SurfaceFlinger上面缓存的所有新创建的Layer拿出来存到本地变量createdLayers中
-        createdLayers = std::move(mCreatedLayers);
-        //清空SurfaceFlinger的缓存
-        mCreatedLayers.clear();
-        if (createdLayers.size() == 0) {
-            return false;
-        }
-    }
-    //遍历新创建的layer
-    for (const auto& createdLayer : createdLayers) {
-        handleLayerCreatedLocked(createdLayer);
-    }
-    //清空本地缓存
-    createdLayers.clear();
-    mLayersAdded = true;
-    return true;
-}
-void SurfaceFlinger::handleLayerCreatedLocked(const LayerCreatedState& state) {
-    //...
-	//34 如果没有父layer，在mCurrentState.layersSortedByZ里添加layer
-    if (parent == nullptr && addToRoot) {
-        layer->setIsAtRoot(true);
-        mCurrentState.layersSortedByZ.add(layer);
-    } else if (parent == nullptr) {
-        layer->onRemovedFromCurrentState();
-    } else if (parent->isRemovedFromCurrentState()) {
-        parent->addChild(layer);
-        layer->onRemovedFromCurrentState();
-    } else {
-        parent->addChild(layer);
-    }
-}
-
-
-bool SurfaceFlinger::flushTransactionQueues(int64_t vsyncId) {
-   	//...
-    return applyTransactions(transactions, vsyncId);
-}
-bool SurfaceFlinger::applyTransactions(std::vector<TransactionState>& transactions,int64_t vsyncId) {
-    for (auto& transaction : transactions) {
-        needsTraversal |=
-            applyTransactionState(transaction.frameTimelineInfo, transaction.states,
-                                  transaction.displays, transaction.flags,
-                                  transaction.inputWindowCommands,
-                                  transaction.desiredPresentTime, transaction.isAutoTimestamp,
-                                  transaction.buffer, transaction.postTime,
-                                  transaction.permissions, transaction.hasListenerCallbacks,
-                                  transaction.listenerCallbacks, transaction.originPid,
-                                  transaction.originUid, transaction.id);
-    }
-    return needsTraversal;
-}
-bool SurfaceFlinger::applyTransactionState(...Vector<ComposerState>& states...){
-    //...
-    for (int i = 0; i < states.size(); i++) {
-        //35 设置layer的具体信息
-        clientStateFlags |= setClientStateLocked(frameTimelineInfo, state, desiredPresentTime,
-                                                 isAutoTimestamp, postTime, permissions);
-        
-        if ((flags & eAnimation) && state.state.surface) {
-            //可以直接通过fromHandle来根据handle拿layer
-            if (const auto layer = fromHandle(state.state.surface).promote()) {
-                using LayerUpdateType = scheduler::LayerHistory::LayerUpdateType;
-                mScheduler->recordLayerHistory(layer.get(),
-                                               isAutoTimestamp ? 0 : desiredPresentTime,
-                                               LayerUpdateType::AnimationTX);
-            }
-        }
-
-    }
-}
-
-uint32_t SurfaceFlinger::setClientStateLocked(... ComposerState& composerState...){
-    layer_state_t& s = composerState.state;
-    //...
-    const uint64_t what = s.what;
-    sp<Layer> layer = nullptr;
-    if (s.surface) {
-        layer = fromHandle(s.surface).promote();
-    } 
-    if (layer == nullptr) {
-        return 0;  
-    }
-    
-    //根据参数对layer进行设置
-    if (what & layer_state_t::ePositionChanged) {
-        if (layer->setPosition(s.x, s.y)) {
-            flags |= eTraversalNeeded;
-        }
-    }
-    if (what & layer_state_t::eSizeChanged) {
-        if (layer->setSize(s.w, s.h)) {
-            flags |= eTraversalNeeded;
-        }
-    }
-    //...省略其他属性设置
-    return flags;
-}
-```
-
-commit这块稍微有点复杂，通过commitCreatedLayers和flushTransactionQueues来判断needsTraversal
-
-+ 注释34处是commitCreatedLayers里往SurfaceFlinger的mCurrentState.layersSortedByZ里缓存了所有的layer，相当于SurfaceFlinger中记录了所有管理的layer
-+ 注释35是取出事务处理的流程，在setClientStateLocked里会SF会根据配置来对Layer进行处理。需要注意的是layer_state_t的surface参数其实就是handle。
-
-```c++
-//LayerState.h
-struct ComposerState {
-    layer_state_t state;
-    status_t write(Parcel& output) const;
-    status_t read(const Parcel& input);
-};
-struct layer_state_t {
-    status_t write(Parcel& output) const;
-    status_t read(const Parcel& input);
-    sp<IBinder> surface;
-    uint32_t w;
-    uint32_t h;
-    sp<SurfaceControl> reparentSurfaceControl;
-    sp<SurfaceControl> relativeLayerSurfaceControl;
-    float shadowRadius;
-    //...
-}
-```
-
-这个layer_state_t里包括了layer的所有信息。
 
 再看注释27中SurfaceComposerClient创建完Surface后基于Handle构建new SurfaceControl
 
@@ -2336,9 +2075,111 @@ void SurfaceFlinger::queueTransaction(TransactionState& state) {
 }
 ```
 
-设置事务状态时构建个TransactionState并加入队列尾部，并设置事务标记为eTransactionFlushNeeded，关于SF设置标记后的流程上面已经看过了，但是handleMessage里commit和composite流程上文未细看
+设置事务状态时构建个TransactionState并加入队列尾部，在注释60处并设置事务标记为eTransactionFlushNeeded，我们继续看setTransactionFlags流程，此流程较复杂
+
+
+```c++
+void SurfaceFlinger::setTransactionFlags(uint32_t mask, TransactionSchedule schedule,
+                                         const sp<IBinder>& applyToken, FrameHint frameHint) {
+    modulateVsync(&VsyncModulator::setTransactionSchedule, schedule, applyToken);
+    if (const bool scheduled = mTransactionFlags.fetch_or(mask) & mask; !scheduled) {
+        scheduleCommit(frameHint);
+    }
+}
+void SurfaceFlinger::scheduleCommit(FrameHint hint) {
+    if (hint == FrameHint::kActive) {
+        mScheduler->resetIdleTimer();
+    }
+    notifyDisplayUpdateImminent();
+    //请求SurfaceFlinger的vsync
+    mScheduler->scheduleFrame();
+}
+
+//Scheduler.h
+class Scheduler : impl::MessageQueue {
+    using Impl = impl::MessageQueue;
+    public:
+    using Impl::scheduleFrame;
+}
+
+//MessageQueue.cpp
+void MessageQueue::scheduleFrame() {
+    //请求SurfaceFlinger的vsync
+    mVsync.scheduledFrameTime =
+        mVsync.registration->schedule({.workDuration = mVsync.workDuration.get().count(),
+                                       .readyDuration = 0,
+                                       .earliestVsync = mVsync.lastCallbackTime.count()});
+}
+
+//VSyncCallbackRegistration.cpp
+ScheduleResult VSyncCallbackRegistration::schedule(VSyncDispatch::ScheduleTiming scheduleTiming) {
+    // mDispatch 是 VSyncDispatchTimerQueue
+    return mDispatch.get().schedule(mToken, scheduleTiming);
+}
+
+//
+ScheduleResult VSyncDispatchTimerQueue::schedule(CallbackToken token,ScheduleTiming scheduleTiming) {
+    //...
+    //VSyncCallbackRegistration 构造的时候，调用registerCallback生成了一个 token ，这个token存储到了 map 对象 mCallbacks 现在拿出来
+    auto it = mCallbacks.find(token);
+     // map 迭代器 second 中存储 VSyncDispatchTimerQueueEntry
+    auto& callback = it->second;
+    // VSyncDispatchTimerQueueEntry 中存储真正的回调函数 MessageQueue::vsyncCallback
+    result = callback->schedule(scheduleTiming, mTracker, now);
+     //...
+}
+
+//在SurfaceFlinger初始化Scheduler时初始化了Vsync
+void SurfaceFlinger::initScheduler(const sp<DisplayDevice>& display) {
+    //...
+    mScheduler->initVsync(mScheduler->getVsyncDispatch(), *mFrameTimeline->getTokenManager(),
+                          configs.late.sfWorkDuration);
+    //...
+}
+
+//MessageQueue::initVsync
+void MessageQueue::initVsync(scheduler::VSyncDispatch& dispatch,
+                             frametimeline::TokenManager& tokenManager,
+                             std::chrono::nanoseconds workDuration) {
+    setDuration(workDuration);
+    mVsync.tokenManager = &tokenManager;
+    //初始化VSyncCallbackRegistration时设定callback为MessageQueue::vsyncCallback
+    mVsync.registration = std::make_unique<
+        scheduler::VSyncCallbackRegistration>(dispatch,
+                                              std::bind(&MessageQueue::vsyncCallback, this,
+                                                        std::placeholders::_1,
+                                                        std::placeholders::_2,
+                                                        std::placeholders::_3),"sf");
+}
+```
+
+可以看到，VSyncDispatchTimerQueueEntry 中存储真正的回调函数是 MessageQueue::vsyncCallback，继续看MessageQueue::vsyncCallback
 
 ```cpp
+//MessageQueue.cpp
+void MessageQueue::vsyncCallback(nsecs_t vsyncTime, nsecs_t targetWakeupTime, nsecs_t readyTime) {
+    // Trace VSYNC-sf
+    mVsync.value = (mVsync.value + 1) % 2;
+    {
+        std::lock_guard lock(mVsync.mutex);
+        mVsync.lastCallbackTime = std::chrono::nanoseconds(vsyncTime);
+        mVsync.scheduledFrameTime.reset();
+    }
+
+    const auto vsyncId = mVsync.tokenManager->generateTokenForPredictions(
+            {targetWakeupTime, readyTime, vsyncTime});
+
+    mHandler->dispatchFrame(vsyncId, vsyncTime);
+}
+void MessageQueue::Handler::dispatchFrame(int64_t vsyncId, nsecs_t expectedVsyncTime) {
+    if (!mFramePending.exchange(true)) {
+        mVsyncId = vsyncId;
+        mExpectedVsyncTime = expectedVsyncTime;
+        //往mQueue.mLooper里发了消息
+        mQueue.mLooper->sendMessage(this, Message());
+    }
+}
+
 void MessageQueue::Handler::handleMessage(const Message&) {
     mFramePending.store(false);
 
@@ -2349,19 +2190,198 @@ void MessageQueue::Handler::handleMessage(const Message&) {
     // mQueue.mCompositor 其实就是 SurfaceFlinger 
     auto& compositor = mQueue.mCompositor;
     
-    //调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite
+    //61 调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite
     if (!compositor.commit(frameTime, mVsyncId, mExpectedVsyncTime)) {
         return;
     }
-    //SF合成流程
+	//SF合成流程
     compositor.composite(frameTime, mVsyncId);
     compositor.sample();
 }
 ```
 
-下面细看下SF的提交合成流程。
+注释61最终会调用到SF的commit，返回false的话，直接返回，否则执行SF的合成流程composite
+
 
 ##### SF的commit和composite流程
+
+下面细看下SF的提交合成流程。
+
+```cpp
+bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) FTL_FAKE_GUARD(kMainThreadContext) {
+    //...
+    bool needsTraversal = false;
+    //返回SurfaceFlinger.mTransactionFlags 是否携带 eTransactionFlushNeeded 标记。同时清除这个标记
+    //上面注释60处传过来的标记就是eTransactionFlushNeeded
+    if (clearTransactionFlags(eTransactionFlushNeeded)) {
+        //处理以前创建的layer，核心就是把新创建的layer加入到Z轴排序集合体系 mCurrentState.layersSortedByZ,
+        //Android12以前layersSortedByZ不是在这里添加的,12之后都通过事务创建
+        needsTraversal |= commitCreatedLayers();
+        needsTraversal |= flushTransactionQueues(vsyncId);
+    }
+    
+    // 61 是否需要执行事务提交。【提交的核心就是把 mCurrentState 赋值给 mDrawingState】
+	// mCurrentState 保存APP传来的数据，mDrawingState 用于合成
+    const bool shouldCommit =
+        (getTransactionFlags() & ~eTransactionFlushNeeded) || needsTraversal;
+    if (shouldCommit) {
+        commitTransactions();
+    }
+
+    //如果还有待处理的事务，请求下一个SF vsync,把标记重新设置成eTransactionFlushNeeded
+    if (transactionFlushNeeded()) {
+        setTransactionFlags(eTransactionFlushNeeded);
+    }
+
+    mustComposite |= shouldCommit;
+    mustComposite |= latchBuffers();
+    //计算边界，脏区域
+    updateLayerGeometry();
+    //...
+}
+bool SurfaceFlinger::commitCreatedLayers() {
+    std::vector<LayerCreatedState> createdLayers;
+    {
+        std::scoped_lock<std::mutex> lock(mCreatedLayersLock);
+        //先把SurfaceFlinger上面缓存的所有新创建的Layer拿出来存到本地变量createdLayers中
+        createdLayers = std::move(mCreatedLayers);
+        //清空SurfaceFlinger的缓存
+        mCreatedLayers.clear();
+        if (createdLayers.size() == 0) {
+            return false;
+        }
+    }
+    //遍历新创建的layer
+    for (const auto& createdLayer : createdLayers) {
+        handleLayerCreatedLocked(createdLayer);
+    }
+    //清空本地缓存
+    createdLayers.clear();
+    //这里先标记mLayersAdded为true，在之后commitTransactionsLocked 函数中会设置回 false
+    mLayersAdded = true;
+    //有新创建的layer，返回false，需执行composite合成操作
+    return true;
+}
+void SurfaceFlinger::handleLayerCreatedLocked(const LayerCreatedState& state) {
+    //...
+	//62 如果没有父layer，在mCurrentState.layersSortedByZ里添加layer
+    if (parent == nullptr && addToRoot) {
+        layer->setIsAtRoot(true);
+        mCurrentState.layersSortedByZ.add(layer);
+    } else if (parent == nullptr) {
+        layer->onRemovedFromCurrentState();
+    } else if (parent->isRemovedFromCurrentState()) {
+        parent->addChild(layer);
+        layer->onRemovedFromCurrentState();
+    } else {
+        parent->addChild(layer);
+    }
+}
+
+
+bool SurfaceFlinger::flushTransactionQueues(int64_t vsyncId) {
+   	//...
+    return applyTransactions(transactions, vsyncId);
+}
+
+//applyTransactions流程: 把事务中的对应flag的数据存入Layer.mDrawingState对应的属性
+//对于Layer删除、调整Z轴，则是把相关数据存入 SurfaceFlinger.mCurrentState.layersSortedByZ
+//对于图形buffer更新而言，核心就是赋值 mDrawingState.buffer
+bool SurfaceFlinger::applyTransactions(std::vector<TransactionState>& transactions,int64_t vsyncId) {
+    for (auto& transaction : transactions) {
+        needsTraversal |=
+            applyTransactionState(transaction.frameTimelineInfo, transaction.states,
+                                  transaction.displays, transaction.flags,
+                                  transaction.inputWindowCommands,
+                                  transaction.desiredPresentTime, transaction.isAutoTimestamp,
+                                  transaction.buffer, transaction.postTime,
+                                  transaction.permissions, transaction.hasListenerCallbacks,
+                                  transaction.listenerCallbacks, transaction.originPid,
+                                  transaction.originUid, transaction.id);
+    }
+    return needsTraversal;
+}
+bool SurfaceFlinger::applyTransactionState(...Vector<ComposerState>& states...){
+    //...
+    for (int i = 0; i < states.size(); i++) {
+        //63 设置layer的具体信息
+        clientStateFlags |= setClientStateLocked(frameTimelineInfo, state, desiredPresentTime,
+                                                 isAutoTimestamp, postTime, permissions);
+        
+        if ((flags & eAnimation) && state.state.surface) {
+            //可以直接通过fromHandle来根据handle拿layer
+            if (const auto layer = fromHandle(state.state.surface).promote()) {
+                using LayerUpdateType = scheduler::LayerHistory::LayerUpdateType;
+                mScheduler->recordLayerHistory(layer.get(),
+                                               isAutoTimestamp ? 0 : desiredPresentTime,
+                                               LayerUpdateType::AnimationTX);
+            }
+        }
+
+    }
+}
+
+uint32_t SurfaceFlinger::setClientStateLocked(... ComposerState& composerState...){
+    layer_state_t& s = composerState.state;
+    //...
+    const uint64_t what = s.what;
+    sp<Layer> layer = nullptr;
+    if (s.surface) {
+        layer = fromHandle(s.surface).promote();
+    } 
+    if (layer == nullptr) {
+        return 0;  
+    }
+    
+    //根据参数对layer进行设置
+    if (what & layer_state_t::ePositionChanged) {
+        if (layer->setPosition(s.x, s.y)) {
+            flags |= eTraversalNeeded;
+        }
+    }
+    if (what & layer_state_t::eSizeChanged) {
+        if (layer->setSize(s.w, s.h)) {
+            flags |= eTraversalNeeded;
+        }
+    }
+    if (what & layer_state_t::eBufferChanged) {
+        //64  BLASTBufferQueue 传递buffer到SF的时候，调用Transaction::setBuffer 添加 eBufferChanged 标记，这里把buffer设置到layer里
+        if (layer->setBuffer(buffer, *s.bufferData, postTime, desiredPresentTime, isAutoTimestamp,
+                             dequeueBufferTimestamp, frameTimelineInfo)) {
+            flags |= eTraversalNeeded;
+        }
+    }
+    //...省略其他属性设置
+    return flags;
+}
+```
+
+commit这块稍微有点复杂
+
++ 注释62处是commitCreatedLayers里往SurfaceFlinger的mCurrentState.layersSortedByZ里缓存了所有的layer，相当于SurfaceFlinger中记录了所有管理的layer
++ 注释63和64在setClientStateLocked里会根据客户端BBQ传到SF里的参数对Layer进行配置，比如把buffer传到layer里。ComposerState是从BBQ传过来的，我们看下ComposerState的构造，需要注意的是layer_state_t的surface参数其实就是handle这个binder对象，通过此handle拿到的layer即在注释28处创建layer时创建的BufferStateLayer
+
+```c++
+//LayerState.h
+struct ComposerState {
+    layer_state_t state;
+    status_t write(Parcel& output) const;
+    status_t read(const Parcel& input);
+};
+struct layer_state_t {
+    status_t write(Parcel& output) const;
+    status_t read(const Parcel& input);
+    sp<IBinder> surface;
+    uint32_t w;
+    uint32_t h;
+    sp<SurfaceControl> reparentSurfaceControl;
+    sp<SurfaceControl> relativeLayerSurfaceControl;
+    float shadowRadius;
+    //...
+}
+```
+
+这个layer_state_t里包括了layer的所有信息。
 
 
 
