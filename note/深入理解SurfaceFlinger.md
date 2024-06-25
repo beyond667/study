@@ -2211,16 +2211,17 @@ void MessageQueue::Handler::handleMessage(const Message&) {
 bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) FTL_FAKE_GUARD(kMainThreadContext) {
     //...
     bool needsTraversal = false;
-    //返回SurfaceFlinger.mTransactionFlags 是否携带 eTransactionFlushNeeded 标记。同时清除这个标记
+    //62 返回SurfaceFlinger.mTransactionFlags 是否携带 eTransactionFlushNeeded 标记。同时清除这个标记
     //上面注释60处传过来的标记就是eTransactionFlushNeeded
     if (clearTransactionFlags(eTransactionFlushNeeded)) {
-        //处理以前创建的layer，核心就是把新创建的layer加入到Z轴排序集合体系 mCurrentState.layersSortedByZ,
+        //63 处理以前创建的layer，核心就是把新创建的layer加入到Z轴排序集合体系 mCurrentState.layersSortedByZ,
         //Android12以前layersSortedByZ不是在这里添加的,12之后都通过事务创建
         needsTraversal |= commitCreatedLayers();
+        //64 flush事务队列，里面会apply事务，处理客户端传过来的数据
         needsTraversal |= flushTransactionQueues(vsyncId);
     }
     
-    // 61 是否需要执行事务提交。【提交的核心就是把 mCurrentState 赋值给 mDrawingState】
+    //65 是否需要执行事务提交。提交的核心就是把 mCurrentState 赋值给 mDrawingState
 	// mCurrentState 保存APP传来的数据，mDrawingState 用于合成
     const bool shouldCommit =
         (getTransactionFlags() & ~eTransactionFlushNeeded) || needsTraversal;
@@ -2233,12 +2234,30 @@ bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expected
         setTransactionFlags(eTransactionFlushNeeded);
     }
 
+    //66 latchBuffers 相当于Android12及以前的handlePageFlip，Android13之后改为latchBuffers
+    //如果有新的buffer的layer大于0，并且拿到了buffer会返回true
     mustComposite |= shouldCommit;
     mustComposite |= latchBuffers();
-    //计算边界，脏区域
+    //67 计算边界，脏区域
     updateLayerGeometry();
     //...
+    return mustComposite && CC_LIKELY(mBootStage != BootStage::BOOTLOADER);
 }
+
+```
+
+commit这块稍微有点复杂
+
++ 注释62处会判断事务的tag是否是eTransactionFlushNeeded，是的话就走注释63和64，此标记是在注释60处传过来的。另外注意到最开始创建layer时设置的标记为eTransactionNeeded，此时并不会触发注释63把layer添加进mCurrentState.layersSortedByZ，更不会走后面合成流程。
++ 注释63 处理以前创建的layer，核心就是把新创建的layer加入到Z轴排序集合体系 mCurrentState.layersSortedByZ
++ 注释64会flush事务队列，里面会apply事务，处理客户端传过来的数据
++ 注释65根据63和64的返回值来判断是否需要提交事务，提交的核心就是把 mCurrentState 赋值给 mDrawingState，即把客户端传过来的mCurrentState数据，赋值给mDrawingState 用于后面合成流程
++ 注释66的latchBuffers 相当于Android12及以前的handlePageFlip，主要目的是检查每个layer的更新
++ 注释67计算边界，脏区
+
+以上步骤我们详细看下，先看注释63处commitCreatedLayers
+
+```c++
 bool SurfaceFlinger::commitCreatedLayers() {
     std::vector<LayerCreatedState> createdLayers;
     {
@@ -2251,7 +2270,7 @@ bool SurfaceFlinger::commitCreatedLayers() {
             return false;
         }
     }
-    //遍历新创建的layer
+    //遍历新创建的layer，通过handleLayerCreatedLocked去添加或者删除此layer
     for (const auto& createdLayer : createdLayers) {
         handleLayerCreatedLocked(createdLayer);
     }
@@ -2264,7 +2283,7 @@ bool SurfaceFlinger::commitCreatedLayers() {
 }
 void SurfaceFlinger::handleLayerCreatedLocked(const LayerCreatedState& state) {
     //...
-	//62 如果没有父layer，在mCurrentState.layersSortedByZ里添加layer
+    //68 如果没有父layer，在mCurrentState.layersSortedByZ里添加layer
     if (parent == nullptr && addToRoot) {
         layer->setIsAtRoot(true);
         mCurrentState.layersSortedByZ.add(layer);
@@ -2277,16 +2296,36 @@ void SurfaceFlinger::handleLayerCreatedLocked(const LayerCreatedState& state) {
         parent->addChild(layer);
     }
 }
+```
 
+注释68处如果没有父layer，在mCurrentState.layersSortedByZ里添加layer，layersSortedByZ即以Z轴排序的集合。继续看注释64处flushTransactionQueues
 
+```cpp
+//LayerState.h
+struct ComposerState {
+    //layer_state_t里包括了layer的所有信息。
+    layer_state_t state;
+    status_t write(Parcel& output) const;
+    status_t read(const Parcel& input);
+};
+struct layer_state_t {
+    status_t write(Parcel& output) const;
+    status_t read(const Parcel& input);
+    sp<IBinder> surface;
+    uint32_t w;
+    uint32_t h;
+    sp<SurfaceControl> reparentSurfaceControl;
+    sp<SurfaceControl> relativeLayerSurfaceControl;
+    float shadowRadius;
+    //...
+}
+//SurfaceFlinger.cpp
 bool SurfaceFlinger::flushTransactionQueues(int64_t vsyncId) {
-   	//...
+    //...
     return applyTransactions(transactions, vsyncId);
 }
 
-//applyTransactions流程: 把事务中的对应flag的数据存入Layer.mDrawingState对应的属性
-//对于Layer删除、调整Z轴，则是把相关数据存入 SurfaceFlinger.mCurrentState.layersSortedByZ
-//对于图形buffer更新而言，核心就是赋值 mDrawingState.buffer
+//applyTransactions流程: 把事务中的对应flag的数据存入Layer
 bool SurfaceFlinger::applyTransactions(std::vector<TransactionState>& transactions,int64_t vsyncId) {
     for (auto& transaction : transactions) {
         needsTraversal |=
@@ -2303,11 +2342,12 @@ bool SurfaceFlinger::applyTransactions(std::vector<TransactionState>& transactio
 }
 bool SurfaceFlinger::applyTransactionState(...Vector<ComposerState>& states...){
     //...
+    //遍历所有客户端传过来的ComposerState
     for (int i = 0; i < states.size(); i++) {
-        //63 设置layer的具体信息
+        // 设置layer的具体信息
         clientStateFlags |= setClientStateLocked(frameTimelineInfo, state, desiredPresentTime,
                                                  isAutoTimestamp, postTime, permissions);
-        
+
         if ((flags & eAnimation) && state.state.surface) {
             //可以直接通过fromHandle来根据handle拿layer
             if (const auto layer = fromHandle(state.state.surface).promote()) {
@@ -2332,7 +2372,7 @@ uint32_t SurfaceFlinger::setClientStateLocked(... ComposerState& composerState..
     if (layer == nullptr) {
         return 0;  
     }
-    
+
     //根据参数对layer进行设置
     if (what & layer_state_t::ePositionChanged) {
         if (layer->setPosition(s.x, s.y)) {
@@ -2345,7 +2385,7 @@ uint32_t SurfaceFlinger::setClientStateLocked(... ComposerState& composerState..
         }
     }
     if (what & layer_state_t::eBufferChanged) {
-        //64  BLASTBufferQueue 传递buffer到SF的时候，调用Transaction::setBuffer 添加 eBufferChanged 标记，这里把buffer设置到layer里
+        //69  BLASTBufferQueue 传递buffer到SF的时候，调用Transaction::setBuffer 添加 eBufferChanged 标记，这里把buffer设置到layer里
         if (layer->setBuffer(buffer, *s.bufferData, postTime, desiredPresentTime, isAutoTimestamp,
                              dequeueBufferTimestamp, frameTimelineInfo)) {
             flags |= eTraversalNeeded;
@@ -2354,34 +2394,146 @@ uint32_t SurfaceFlinger::setClientStateLocked(... ComposerState& composerState..
     //...省略其他属性设置
     return flags;
 }
-```
 
-commit这块稍微有点复杂
-
-+ 注释62处是commitCreatedLayers里往SurfaceFlinger的mCurrentState.layersSortedByZ里缓存了所有的layer，相当于SurfaceFlinger中记录了所有管理的layer
-+ 注释63和64在setClientStateLocked里会根据客户端BBQ传到SF里的参数对Layer进行配置，比如把buffer传到layer里。ComposerState是从BBQ传过来的，我们看下ComposerState的构造，需要注意的是layer_state_t的surface参数其实就是handle这个binder对象，通过此handle拿到的layer即在注释28处创建layer时创建的BufferStateLayer
-
-```c++
-//LayerState.h
-struct ComposerState {
-    layer_state_t state;
-    status_t write(Parcel& output) const;
-    status_t read(const Parcel& input);
-};
-struct layer_state_t {
-    status_t write(Parcel& output) const;
-    status_t read(const Parcel& input);
-    sp<IBinder> surface;
-    uint32_t w;
-    uint32_t h;
-    sp<SurfaceControl> reparentSurfaceControl;
-    sp<SurfaceControl> relativeLayerSurfaceControl;
-    float shadowRadius;
+//BufferStateLayer.cpp
+bool BufferStateLayer::setBuffer(std::shared_ptr<renderengine::ExternalTexture>& buffer...) {
+    //...
+    mDrawingState.frameNumber = frameNumber;
+    mDrawingState.releaseBufferListener = bufferData.releaseBufferListener;
+    //这里的 mDrawingState 是 Layer 的，和SurfaceFlinger的 mDrawingState 不是一个类
+    mDrawingState.buffer = std::move(buffer);
+    //...
+    mDrawingState.modified = true;
+    setTransactionFlags(eTransactionNeeded);
     //...
 }
 ```
 
-这个layer_state_t里包括了layer的所有信息。
+在setClientStateLocked会把客户端传过来的layer_state_t里的数据设置到layer里。
 
++ 注释69处把buffer传到layer里，此layer即注释29处创建的BufferStateLayer
 
+在BufferStateLayer的setBuffer中把buffer存到layer的mDrawingState里，和SurfaceFlinger的 mDrawingState 不是一个类。再看注释65的commitTransactions
+
+```c++
+void SurfaceFlinger::commitTransactions() {
+    State drawingState(mDrawingState);
+    //事务提交，先加锁
+    Mutex::Autolock lock(mStateLock);
+    modulateVsync(&VsyncModulator::onTransactionCommit);
+    
+    commitTransactionsLocked(clearTransactionFlags(eTransactionMask));
+    mDebugInTransaction = 0;
+}
+void SurfaceFlinger::commitTransactionsLocked(uint32_t transactionFlags) {
+    //屏幕的热插拔SurfaceFlinger::onComposerHalHotplug会调用 setTransactionFlags(eDisplayTransactionNeeded)，然后到这里处理
+    const bool displayTransactionNeeded = transactionFlags & eDisplayTransactionNeeded;
+    if (displayTransactionNeeded) { 
+        processDisplayChangesLocked();
+        processDisplayHotplugEventsLocked();
+    }
+    mForceTransactionDisplayChange = displayTransactionNeeded;
+    //...
+    //注释63处commitCreatedLayers流程中会把mLayersAdded设为true，这里还原
+    if (mLayersAdded) {
+        mLayersAdded = false;
+        // Layers have been added.
+        mVisibleRegionsDirty = true;
+    }
+    //如果是要处理移除layer
+    if (mLayersRemoved) {
+        mLayersRemoved = false;
+        mVisibleRegionsDirty = true;
+        mDrawingState.traverseInZOrder([&](Layer* layer) {
+            if (mLayersPendingRemoval.indexOf(layer) >= 0) {
+                // this layer is not visible anymore
+                Region visibleReg;
+                visibleReg.set(layer->getScreenBounds());
+                invalidateLayerStack(layer, visibleReg);
+            }
+        });
+    }
+    //真正提交事务
+    doCommitTransactions();
+}
+void SurfaceFlinger::doCommitTransactions() {
+    // 处理以及被移除的layer集合 mLayersPendingRemoval。释放buffer，从layersSortedByZ移除，加入到mOffscreenLayers
+    if (!mLayersPendingRemoval.isEmpty()) {
+        for (const auto& l : mLayersPendingRemoval) {
+            if (l->isRemovedFromCurrentState()) {
+                l->latchAndReleaseBuffer();
+            }
+            if (l->isAtRoot()) {
+                l->setIsAtRoot(false);
+                mCurrentState.layersSortedByZ.remove(l);
+            }
+            if (!l->getParent()) {
+                mOffscreenLayers.emplace(l.get());
+            }
+        }
+        mLayersPendingRemoval.clear();
+    }
+    //70 把已经处理过的mCurrentState直接赋值给mDrawingState
+    mDrawingState = mCurrentState;
+    mCurrentState.colorMatrixChanged = false;
+
+    if (mVisibleRegionsDirty) {
+        for (const auto& rootLayer : mDrawingState.layersSortedByZ) {
+            rootLayer->commitChildList();
+        }
+    }
+    commitOffscreenLayers();
+}
+
+void Layer::commitChildList() {
+    //...
+    mDrawingChildren = mCurrentChildren;
+    mDrawingParent = mCurrentParent;
+    //...
+}
+```
+
+注释70处把已经处理过的mCurrentState直接赋值给mDrawingState，后面就会处理mDrawingState。继续看注释66处66 latchBuffers
+
+```cpp
+bool SurfaceFlinger::latchBuffers() {
+    //...
+  // Store the set of layers that need updates. This set must not change as
+    // buffers are being latched, as this could result in a deadlock.
+    // Example: Two producers share the same command stream and:
+    // 1.) Layer 0 is latched
+    // 2.) Layer 0 gets a new frame
+    // 2.) Layer 1 gets a new frame
+    // 3.) Layer 1 is latched.
+    // Display is now waiting on Layer 1's frame, which is behind layer 0's
+    // second frame. But layer 0's second frame could be waiting on display.
+    // 上面英文注释说明这块是把有buffer更新的layer存储到set集合。在buffers latch的过程中，不能更新set集合，否则可能导致死锁
+    mDrawingState.traverse([&](Layer* layer) {
+        if (layer->clearTransactionFlags(eTransactionNeeded) || mForceTransactionDisplayChange) {
+            const uint32_t flags = layer->doTransaction(0);
+            if (flags & Layer::eVisibleRegion) {
+                mVisibleRegionsDirty = true;
+            }
+        }
+
+        if (layer->hasReadyFrame()) {
+            frameQueued = true;
+            if (layer->shouldPresentNow(expectedPresentTime)) {
+                mLayersWithQueuedFrames.emplace(layer);
+                if (wakeUpPresentationDisplays) {
+                    layerStackId = layer->getLayerStack().id;
+                    layerStackIds.insert(layerStackId);
+                }
+            } else {
+                ATRACE_NAME("!layer->shouldPresentNow()");
+                layer->useEmptyDamage();
+            }
+        } else {
+            layer->useEmptyDamage();
+        }
+    });
+    mForceTransactionDisplayChange = false;
+
+}
+```
 
