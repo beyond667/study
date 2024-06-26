@@ -2738,3 +2738,94 @@ void SurfaceFlinger::computeLayerBounds() {
 ##### SF的composite流程
 
 再继续看composite合成流程。
+
+```cpp
+void SurfaceFlinger::composite(nsecs_t frameTime, int64_t vsyncId)
+    FTL_FAKE_GUARD(kMainThreadContext) {
+    //72 构建准备合成的参数
+    compositionengine::CompositionRefreshArgs refreshArgs;
+    //在SF.h文件定义 ftl::SmallMap<wp<IBinder>, const sp<DisplayDevice>, 5> mDisplays GUARDED_BY(mStateLock);
+    //这种写法没看懂，从上下文理解应该是通过binder拿到所有的显示设备
+    //合成是以mDisplays里面的顺序去合成的，内置的显示器是在开机时就加入的，所以优先于外部显示器
+    const auto& displays = FTL_FAKE_GUARD(mStateLock, mDisplays);
+    // 增加容器的大小为显示屏的大小
+    refreshArgs.outputs.reserve(displays.size());
+    std::vector<DisplayId> displayIds;
+    //遍历所有的显示器，调用每个getCompositionDisplay方法，获取需要合成的显示器
+    for (const auto& [_, display] : displays) {
+        //outputs代表所有需要合成的显示器
+        refreshArgs.outputs.push_back(display->getCompositionDisplay());
+        displayIds.push_back(display->getId());
+    }
+    mPowerAdvisor->setDisplays(displayIds);
+    //遍历mDrawingState.layersSortedByZ，其存储了所有的的layer
+    mDrawingState.traverseInZOrder([&refreshArgs](Layer* layer) {
+        //只有 BufferLayer和EffectLayer 实现了这个方法，返回layer自身，并强转为父类Layer
+        if (auto layerFE = layer->getCompositionEngineLayerFE())
+            //添加所有需要合成的layer
+            refreshArgs.layers.push_back(layerFE);
+    });
+    //mLayersWithQueuedFrames是有新的帧数据的Layer
+    refreshArgs.layersWithQueuedFrames.reserve(mLayersWithQueuedFrames.size());
+    //把有帧数据的Layer转移到 refreshArgs.layersWithQueuedFrames
+    for (auto layer : mLayersWithQueuedFrames) {
+        if (auto layerFE = layer->getCompositionEngineLayerFE())
+            refreshArgs.layersWithQueuedFrames.push_back(layerFE);
+    }
+    //合成参数refreshArgs其他字段进行赋值
+    refreshArgs.forceOutputColorMode = mForceColorMode;
+    //...
+    //73 合成参数传到合成引擎，开始真正合成工作
+    mCompositionEngine->present(refreshArgs);
+    //...
+    //没啥东西，只是打了些log
+    postFrame();
+    //74 合成后的收尾工作，比如释放buffer
+    postComposition();
+
+}
+```
+
+SurfaceFlinger::composite这里合成流程较清晰。先在注释72处构建需要合成的参数，上面注释很清楚，主要把需要合成的display，layer，有帧数据的layer等添加到此参数里，然后在注释73处通过合成引擎去真正完成合成工作，最后在注释74处postComposition做些收尾工作。我们主要看注释73处mCompositionEngine->present真正合成的流程，此过程较复杂，是SF合成的核心。
+
+```cpp
+void CompositionEngine::present(CompositionRefreshArgs& args) {
+    //合成前预处理
+    preComposition(args);
+    {
+        LayerFESet latchedLayers;
+        //遍历所有需要合成输出的显示设备，核心是把显示区域相关数据转存到OutputLayer的mState对象
+        for (const auto& output : args.outputs) {
+            //74 调用每个显示设备的prepare方法
+            output->prepare(args, latchedLayers);
+        }
+    }
+    //75 把状态属性转移到 BufferLayer.mCompositionState
+    //这个对象是 compositionengine::LayerFECompositionState 类型
+    //可以通过 LayerFE.getCompositionState() 获取合成状态对象。
+    //不算EffectLayer的话，其实就是就是获取 BufferLayer.mCompositionState
+    updateLayerStateFromFE(args);
+    //76 调用每个显示设备的present方法
+    for (const auto& output : args.outputs) {
+        output->present(args);
+    }
+}
+
+void CompositionEngine::preComposition(CompositionRefreshArgs& args) {
+    bool needsAnotherUpdate = false;
+    for (auto& layer : args.layers) {
+        //遍历每个layer执行其onPreComposition
+        if (layer->onPreComposition(mRefreshStartTime)) {
+            needsAnotherUpdate = true;
+        }
+    }
+    mNeedsAnotherUpdate = needsAnotherUpdate;
+}
+```
+
+合成前先执行每个layer的onPreComposition，不再细看。
+
++ 注释74先调用每个显示器的prepare
++ 注释75把状态属性转移到 BufferLayer.mCompositionState
++ 注释76调用每个显示器的present
+
