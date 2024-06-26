@@ -2203,9 +2203,9 @@ void MessageQueue::Handler::handleMessage(const Message&) {
 注释61最终会调用到SF的commit，返回false的话，直接返回，否则执行SF的合成流程composite
 
 
-##### SF的commit和composite流程
+##### SF的commit流程
 
-下面细看下SF的提交合成流程。
+下面细看下SF的提交合成流程，先看commit提交流程。
 
 ```cpp
 bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expectedVsyncTime) FTL_FAKE_GUARD(kMainThreadContext) {
@@ -2322,6 +2322,47 @@ struct layer_state_t {
 //SurfaceFlinger.cpp
 bool SurfaceFlinger::flushTransactionQueues(int64_t vsyncId) {
     //...
+    while (!mTransactionQueue.empty()) {
+        auto& transaction = mTransactionQueue.front();
+        //看看当前的Transaction是否已经ready，没有ready则不传递Transaction
+        const auto ready = [&]() REQUIRES(mStateLock) {
+            if (pendingTransactions) {
+                return TransactionReadiness::NotReady;
+            }
+
+            return transactionIsReadyToBeApplied(transaction, transaction.frameTimelineInfo,
+                                                 transaction.isAutoTimestamp,
+                                                 transaction.desiredPresentTime,
+                                                 transaction.originUid, transaction.states,
+                                                 bufferLayersReadyToPresent,
+                                                 transactions.size(),
+                                                 /*tryApplyUnsignaled*/ false);
+        }();
+        if (ready != TransactionReadiness::Ready) {
+            //没ready的话添加到mPendingTransactionQueues
+            mPendingTransactionQueues[transaction.applyToken].push(std::move(transaction));
+        }else{
+            //已经ready则进入如下的操作
+            transaction.traverseStatesWithBuffers([&](const layer_state_t& state) {
+                const bool frameNumberChanged = state.bufferData->flags.test(
+                    BufferData::BufferDataChange::frameNumberChanged);
+                //会把state放入到bufferLayersReadyToPresent这个map中
+                if (frameNumberChanged) { 
+                    bufferLayersReadyToPresent[state.surface] = state.bufferData->frameNumber;
+                } else {
+                    // Barrier function only used for BBQ which always includes a frame number.
+                    // This value only used for barrier logic.
+                    bufferLayersReadyToPresent[state.surface] =
+                        std::numeric_limits<uint64_t>::max();
+                }
+            });
+            //最重要的放入到transactions
+            transactions.emplace_back(std::move(transaction));
+        }
+
+    }
+    //上面主要是遍历mTransactionQueue获取已经Ready的Transaction，添加到transactions
+    //最后执行最关键的应用事务
     return applyTransactions(transactions, vsyncId);
 }
 
@@ -2413,7 +2454,7 @@ bool BufferStateLayer::setBuffer(std::shared_ptr<renderengine::ExternalTexture>&
 
 + 注释69处把buffer传到layer里，此layer即注释29处创建的BufferStateLayer
 
-在BufferStateLayer的setBuffer中把buffer存到layer的mDrawingState里，和SurfaceFlinger的 mDrawingState 不是一个类。再看注释65的commitTransactions
+在BufferStateLayer的setBuffer中把buffer存到layer的mDrawingState的buffer里，和SurfaceFlinger的 mDrawingState 不是一个类。再看注释65的commitTransactions
 
 ```c++
 void SurfaceFlinger::commitTransactions() {
@@ -2509,16 +2550,19 @@ bool SurfaceFlinger::latchBuffers() {
     // second frame. But layer 0's second frame could be waiting on display.
     // 上面英文注释说明这块是把有buffer更新的layer存储到set集合。在buffers latch的过程中，不能更新set集合，否则可能导致死锁
     mDrawingState.traverse([&](Layer* layer) {
+        //layer各种属性变化后都会设置 eTransactionNeeded 这个flag，比如尺寸，背景，位置，inputInfo、刷新率等等，几乎所有的变化都会设置eTransactionNeeded。
         if (layer->clearTransactionFlags(eTransactionNeeded) || mForceTransactionDisplayChange) {
             const uint32_t flags = layer->doTransaction(0);
             if (flags & Layer::eVisibleRegion) {
                 mVisibleRegionsDirty = true;
             }
         }
-
+        // layer有新buffer时，hasReadyFrame() 返回true
         if (layer->hasReadyFrame()) {
             frameQueued = true;
+            //对于 BufferStateLayer 而言，有buffer的来了，就返回true
             if (layer->shouldPresentNow(expectedPresentTime)) {
+                //把有新buffer的layer，加入set集合 mLayersWithQueuedFrames
                 mLayersWithQueuedFrames.emplace(layer);
                 if (wakeUpPresentationDisplays) {
                     layerStackId = layer->getLayerStack().id;
@@ -2533,7 +2577,164 @@ bool SurfaceFlinger::latchBuffers() {
         }
     });
     mForceTransactionDisplayChange = false;
-
+	//mLayersWithQueuedFrames集合不为空的话，遍历每个需要更新的layer，分别执行其latchBuffer
+    if (!mLayersWithQueuedFrames.empty()) {
+        for (const auto& layer : mLayersWithQueuedFrames) {
+            //71 latchBuffer 判断是否需要重新计算显示区域，由参数visibleRegions带回结果
+            if (layer->latchBuffer(visibleRegions, latchTime, expectedPresentTime)) {
+                //把layer加入mLayersPendingRefresh，其保存了GPU绘制已经完成的layer
+                mLayersPendingRefresh.push_back(layer);
+                newDataLatched = true;
+            }
+            layer->useSurfaceDamage();
+        }
+    }
 }
 ```
 
+SurfaceFlinger::latchBuffers会把有buffer更新的layer先添加到mLayersWithQueuedFrames，再遍历此集合，分别执行每个layer的latchBuffer方法。
+
++ 注释71处每个layer执行latchBuffer方法，如果需要重新计算显示区域返回true，并加到mLayersPendingRefresh，此集合保存了GPU已经绘制完成的layer
+
+看下每个layer执行的latchBuffer
+
+```cpp
+//BufferLayer.cpp
+bool BufferLayer::latchBuffer(bool& recomputeVisibleRegions, nsecs_t latchTime,nsecs_t expectedPresentTime) {
+    //如果Fence还没有发送信号，请求 SF-vsync，并且函数返回，等一下次的vsync再处理这个buffer
+    if (!fenceHasSignaled()) {
+        mFlinger->onLayerUpdate();
+        return false;
+    }
+	//调用到BufferStateLayer中的updateTexImage，主要是为debug用的，构建一些tracer
+    status_t err = updateTexImage(recomputeVisibleRegions, latchTime, expectedPresentTime);
+    //state的相关buffer数据赋值给mBufferInfo
+    err = updateActiveBuffer();
+    //把mDrawingState中buffer相关信息的各种变量转移到 mBufferInfo 中
+    gatherBufferInfo();
+
+    //...
+    return true;
+}
+```
+
+BufferLayer的latchBuffer相当于java里的模版方法，里面调用的updateTexImage，updateActiveBuffer，gatherBufferInfo实际调用了父类BufferStateLayer的相关方法。
+
+```cpp
+status_t BufferStateLayer::updateTexImage(bool& /*recomputeVisibleRegions*/, nsecs_t latchTime,nsecs_t /*expectedPresentTime*/) {
+	//...
+    //每个layer有唯一的一个sequence，递增
+    const int32_t layerId = getSequence();
+    const uint64_t bufferId = mDrawingState.buffer->getId();
+    const uint64_t frameNumber = mDrawingState.frameNumber;
+    const auto acquireFence = std::make_shared<FenceTime>(mDrawingState.acquireFence);
+    //perfetto 相应的数据源配置启用的情况下，记录 Fence 和 latchTime
+    mFlinger->mTimeStats->setAcquireFence(layerId, frameNumber, acquireFence);
+    mFlinger->mTimeStats->setLatchTime(layerId, frameNumber, latchTime);
+    mFlinger->mFrameTracer->traceFence(layerId, bufferId, frameNumber, acquireFence,FrameTracer::FrameEvent::ACQUIRE_FENCE);
+    mFlinger->mFrameTracer->traceTimestamp(layerId, bufferId, frameNumber, latchTime,FrameTracer::FrameEvent::LATCH);
+
+    //如果mDrawingState.bufferSurfaceFrameTX非Presented状态，重置下
+    auto& bufferSurfaceFrame = mDrawingState.bufferSurfaceFrameTX;
+    if (bufferSurfaceFrame != nullptr &&
+        bufferSurfaceFrame->getPresentState() != PresentState::Presented) {
+        addSurfaceFramePresentedForBuffer(bufferSurfaceFrame,
+                                          mDrawingState.acquireFenceTime->getSignalTime(),
+                                          latchTime);
+        mDrawingState.bufferSurfaceFrameTX.reset();
+    }
+
+    //设置下mDrawingState.callbackHandles
+    std::deque<sp<CallbackHandle>> remainingHandles;
+    mFlinger->getTransactionCallbackInvoker()
+        .addOnCommitCallbackHandles(mDrawingState.callbackHandles, remainingHandles);
+    mDrawingState.callbackHandles = remainingHandles;
+
+    mDrawingStateModified = false;
+    return NO_ERROR;
+}
+
+status_t BufferStateLayer::updateActiveBuffer() {
+    const State& s(getDrawingState());
+
+    if (s.buffer == nullptr) {
+        return BAD_VALUE;
+    }
+
+    // buffer不为空，把待处理的buffer数量计数器mPendingBufferTransactions减一
+    if (!mBufferInfo.mBuffer || !s.buffer->hasSameBuffer(*mBufferInfo.mBuffer)) {
+        decrementPendingBufferCount();
+    }
+
+    mPreviousReleaseCallbackId = {getCurrentBufferId(), mBufferInfo.mFrameNumber};
+    // 把 mDrawingState 中的buffer、acquireFence、frameNumber转移到mBufferInfo
+    mBufferInfo.mBuffer = s.buffer;
+    mBufferInfo.mFence = s.acquireFence;
+    mBufferInfo.mFrameNumber = s.frameNumber;
+
+    return NO_ERROR;
+}
+
+void BufferStateLayer::gatherBufferInfo() {
+    BufferLayer::gatherBufferInfo();
+
+    const State& s(getDrawingState());
+    //把 mDrawingState 中的其他信息转移到mBufferInfo
+    mBufferInfo.mDesiredPresentTime = s.desiredPresentTime;
+    mBufferInfo.mFenceTime = std::make_shared<FenceTime>(s.acquireFence);
+    mBufferInfo.mFence = s.acquireFence;
+    mBufferInfo.mTransform = s.bufferTransform;
+    auto lastDataspace = mBufferInfo.mDataspace;
+    mBufferInfo.mDataspace = translateDataspace(s.dataspace);
+    if (lastDataspace != mBufferInfo.mDataspace) {
+        mFlinger->mSomeDataspaceChanged = true;
+    }
+    mBufferInfo.mCrop = computeBufferCrop(s);
+    mBufferInfo.mScaleMode = NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW;
+    mBufferInfo.mSurfaceDamage = s.surfaceDamageRegion;
+    mBufferInfo.mHdrMetadata = s.hdrMetadata;
+    mBufferInfo.mApi = s.api;
+    mBufferInfo.mTransformToDisplayInverse = s.transformToDisplayInverse;
+    mBufferInfo.mBufferSlot = mHwcSlotGenerator->getHwcCacheSlot(s.clientCacheId);
+}
+```
+
+可以看到latchBuffer调用的这几个方法主要还是想把前面Transaction时候赋值到了Layer的mDrawingState和buffer相关的数据赋值到Layer的mBufferInfo中。再继续看注释67处计算边界脏区域
+
+```c++
+void SurfaceFlinger::updateLayerGeometry() {
+    //mVisibleRegionsDirty在有新的Layer增加时设置为 true
+    if (mVisibleRegionsDirty) {
+        //调用每个Layer的 computeBounds 方法
+        computeLayerBounds();
+    }
+
+    //mLayersPendingRefresh这个集合表示有新的buffer更新，并且能拿到buffer的layer。在 SurfaceFlinger::latchBuffers()流程中添加(注释71处)
+    for (auto& layer : mLayersPendingRefresh) {
+        Region visibleReg;
+        visibleReg.set(layer->getScreenBounds());
+        // 对每个包含当前layer的显示器的脏区域初始化为 Layer.mScreenBounds
+        invalidateLayerStack(layer, visibleReg);
+    }
+
+    setDisplayAnimating();
+    //清空mLayersPendingRefresh
+    mLayersPendingRefresh.clear();
+}
+
+void SurfaceFlinger::computeLayerBounds() {
+    const FloatRect maxBounds = getMaxDisplayBounds();
+    //遍历mDrawingState.layersSortedByZ，调用每个Layer的 computeBounds 方法
+    for (const auto& layer : mDrawingState.layersSortedByZ) {
+        layer->computeBounds(maxBounds, ui::Transform(), 0.f /* shadowRadius */);
+    }
+}
+```
+
+在有新layer增加时会调用每个layer的computeBounds，计算每个layer的边界；再根据SurfaceFlinger::latchBuffers时拿到的mLayersPendingRefresh这个集合计算脏区域。  
+
+到这里commit流程就结束了，需要走合成流程时返回true，否则返回false。
+
+##### SF的composite流程
+
+再继续看composite合成流程。
