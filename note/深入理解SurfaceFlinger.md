@@ -2829,3 +2829,62 @@ void CompositionEngine::preComposition(CompositionRefreshArgs& args) {
 + 注释75把状态属性转移到 BufferLayer.mCompositionState
 + 注释76调用每个显示器的present
 
+重点看以上流程，先看注释74调用每个显示器的prepare
+
+> frameworks/native/services/surfaceflinger/CompositionEngine/src/Output.cpp
+
+```c++
+void Output::prepare(const compositionengine::CompositionRefreshArgs& refreshArgs,LayerFESet& geomSnapshots) {
+    rebuildLayerStacks(refreshArgs, geomSnapshots);
+}
+void Output::rebuildLayerStacks(const compositionengine::CompositionRefreshArgs& refreshArgs,LayerFESet& layerFESet) {
+    //获取output状态，返回OutputCompositionState类型的Output.mState
+    auto& outputState = editState();
+    //如果output状态是关闭或者没必要更新直接返回
+    if (!outputState.isEnabled || CC_LIKELY(!refreshArgs.updatingOutputGeometryThisFrame)) {
+        return;
+    }
+    compositionengine::Output::CoverageState coverage{layerFESet};
+    //收集所有可见的layer
+    collectVisibleLayers(refreshArgs, coverage);
+    //...
+}
+
+void Output::collectVisibleLayers(const compositionengine::CompositionRefreshArgs& refreshArgs,
+                                  compositionengine::Output::CoverageState& coverage) {
+    //从顶层到底层遍历所有参与合成的Layer，累积计算覆盖区域、完全不透明区域、脏区域
+    //存储当前层的显示区域、排除透明区域的显示区域、被覆盖区域、显示器空间显示区域、阴影区域等到当前显示设备上的OutputLayer的mState对象
+    for (auto layer : reversed(refreshArgs.layers)) {
+        ensureOutputLayerIfVisible(layer, coverage);
+    }
+
+    //setReleasedLayers 函数会遍历 Output.mCurrentOutputLayersOrderedByZ
+    //此时Output.mCurrentOutputLayersOrderedByZ中会在当前vsync显示的layer都转移到了mPendingOutputLayersOrderedByZ
+    // 这里会把mCurrentOutputLayersOrderedByZ余下的Layer中，在当前vsync，入队新的buffer的layer放入到 Output.mReleasedLayers 中
+    //就是说，mReleasedLayers是一些即将移除的的layer，但是当前vsync还在生产帧数据的layer
+    setReleasedLayers(refreshArgs);
+    //把Output.mPendingOutputLayersOrderedByZ转到Output.mCurrentOutputLayersOrderedByZ
+    //每个vsync内，Output中存储的OutputLayer，都是最新即将要显示的Layer
+    finalizePendingOutputLayers();
+}
+
+void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
+                                        compositionengine::Output::CoverageState& coverage) {
+    Region opaqueRegion;
+    Region visibleRegion;
+    Region coveredRegion;
+    Region transparentRegion;
+    Region shadowRegion;
+    //...省略计算这些区域的过程
+    auto result = ensureOutputLayer(prevOutputLayerIndex, layerFE);
+    //存储以上区域到当前显示设备上的OutputLayer的mState对象
+    auto& outputLayerState = result->editState();
+    outputLayerState.visibleRegion = visibleRegion;
+    outputLayerState.visibleNonTransparentRegion = visibleNonTransparentRegion;
+    outputLayerState.coveredRegion = coveredRegion;
+    outputLayerState.outputSpaceVisibleRegion = outputState.transform.transform(
+        visibleNonShadowRegion.intersect(outputState.layerStackSpace.getContent()));
+    outputLayerState.shadowRegion = shadowRegion;
+}
+```
+
