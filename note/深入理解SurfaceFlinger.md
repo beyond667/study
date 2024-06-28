@@ -2847,7 +2847,15 @@ void Output::rebuildLayerStacks(const compositionengine::CompositionRefreshArgs&
     compositionengine::Output::CoverageState coverage{layerFESet};
     //收集所有可见的layer
     collectVisibleLayers(refreshArgs, coverage);
-    //...
+    
+    const ui::Transform& tr = outputState.transform;
+    Region undefinedRegion{outputState.displaySpace.getBoundsAsRect()};
+    //整个显示空间减去所有Layer的不透明覆盖区域为未定义的区域
+    undefinedRegion.subtractSelf(tr.transform(coverage.aboveOpaqueLayers));
+    outputState.undefinedRegion = undefinedRegion;
+    //把计算好的脏区域传入outputState.dirtyRegion 
+    //在Output::postFramebuffer()中会被清空
+    outputState.dirtyRegion.orSelf(coverage.dirtyRegion);
 }
 
 void Output::collectVisibleLayers(const compositionengine::CompositionRefreshArgs& refreshArgs,
@@ -2858,13 +2866,10 @@ void Output::collectVisibleLayers(const compositionengine::CompositionRefreshArg
         ensureOutputLayerIfVisible(layer, coverage);
     }
 
-    //setReleasedLayers 函数会遍历 Output.mCurrentOutputLayersOrderedByZ
-    //此时Output.mCurrentOutputLayersOrderedByZ中会在当前vsync显示的layer都转移到了mPendingOutputLayersOrderedByZ
-    // 这里会把mCurrentOutputLayersOrderedByZ余下的Layer中，在当前vsync，入队新的buffer的layer放入到 Output.mReleasedLayers 中
-    //就是说，mReleasedLayers是一些即将移除的的layer，但是当前vsync还在生产帧数据的layer
+    //把不需要显示的layer放到mReleasedLayers，准备释放
     setReleasedLayers(refreshArgs);
+
     //把Output.mPendingOutputLayersOrderedByZ转到Output.mCurrentOutputLayersOrderedByZ
-    //每个vsync内，Output中存储的OutputLayer，都是最新即将要显示的Layer
     finalizePendingOutputLayers();
 }
 
@@ -2876,6 +2881,9 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
     Region transparentRegion;
     Region shadowRegion;
     //...省略计算这些区域的过程
+    // The layer is visible. Either reuse the existing outputLayer if we have
+    // one, or create a new one if we do not.
+    //如果显示设备没有对应的 OutputLayer，创建 OutputLayer 同时创建 HWCLayer，并作为 OutputLayer.mState 的成员
     auto result = ensureOutputLayer(prevOutputLayerIndex, layerFE);
     //存储以上区域到当前显示设备上的OutputLayer的mState对象
     auto& outputLayerState = result->editState();
@@ -2886,5 +2894,401 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
         visibleNonShadowRegion.intersect(outputState.layerStackSpace.getContent()));
     outputLayerState.shadowRegion = shadowRegion;
 }
+//Output.h
+OutputLayer* ensureOutputLayer(std::optional<size_t> prevIndex,
+                               const sp<LayerFE>& layerFE) {
+    auto outputLayer = (prevIndex && *prevIndex <= mCurrentOutputLayersOrderedByZ.size())
+        ? std::move(mCurrentOutputLayersOrderedByZ[*prevIndex])
+        : BaseOutput::createOutputLayer(layerFE);
+    auto result = outputLayer.get();
+    mPendingOutputLayersOrderedByZ.emplace_back(std::move(outputLayer));
+    return result;
+}
+
+//Display.cpp  
+//Display继承于Output
+std::unique_ptr<compositionengine::OutputLayer> Display::createOutputLayer(
+    const sp<compositionengine::LayerFE>& layerFE) const {
+    //先创建OutputLayer
+    auto outputLayer = impl::createOutputLayer(*this, layerFE);
+    if (const auto halDisplayId = HalDisplayId::tryCast(mId);
+        outputLayer && !mIsDisconnected && halDisplayId) {
+        //同时创建 HWCLayer，并作为 OutputLayer.mState 的成员
+        auto& hwc = getCompositionEngine().getHwComposer();
+        auto hwcLayer = hwc.createLayer(*halDisplayId);
+        outputLayer->setHwcLayer(std::move(hwcLayer));
+        //...
+    }
+}
+
+//setReleasedLayers 函数会遍历 Output.mCurrentOutputLayersOrderedByZ
+//此时Output.mCurrentOutputLayersOrderedByZ中在当前vsync显示的layer都转移到了mPendingOutputLayersOrderedByZ
+// 这里会把mCurrentOutputLayersOrderedByZ余下的Layer中，在当前vsync，入队新的buffer的layer放入到 Output.mReleasedLayers 中
+//就是说，mReleasedLayers是一些即将移除的的layer，但是当前vsync还在生产帧数据的layer
+void Display::setReleasedLayers(const compositionengine::CompositionRefreshArgs& refreshArgs) {
+    compositionengine::Output::ReleasedLayers releasedLayers;
+    for (auto* outputLayer : getOutputLayersOrderedByZ()) {
+        compositionengine::LayerFE* layerFE = &outputLayer->getLayerFE();
+        const bool hasQueuedFrames =
+            std::any_of(refreshArgs.layersWithQueuedFrames.cbegin(),
+                        refreshArgs.layersWithQueuedFrames.cend(),
+                        [layerFE](sp<compositionengine::LayerFE> layerWithQueuedFrames) {
+                            return layerFE == layerWithQueuedFrames.get();
+                        });
+
+        if (hasQueuedFrames) {
+            releasedLayers.emplace_back(layerFE);
+        }
+    }
+
+    setReleasedLayers(std::move(releasedLayers));
+}
+//Output.h
+//把Output.mPendingOutputLayersOrderedByZ转到Output.mCurrentOutputLayersOrderedByZ
+//每个vsync内，Output中存储的OutputLayer，都是最新即将要显示的Layer
+void finalizePendingOutputLayers() override {
+    // The pending layers are added in reverse order. Reverse them to
+    // get the back-to-front ordered list of layers.
+    //pendding layers添加的时候是反的，所以先把其反转下再赋值给mCurrentOutputLayersOrderedByZ
+    std::reverse(mPendingOutputLayersOrderedByZ.begin(),
+                 mPendingOutputLayersOrderedByZ.end());
+
+    mCurrentOutputLayersOrderedByZ = std::move(mPendingOutputLayersOrderedByZ);
+}
+```
+
+prepare的过程，其实就是从顶层到底层遍历所有参与合成的Layer，计算其显示区域等到当前显示设备上的OutputLayer的mState上，把不需要显示的layer放到mReleasedLayers。继续看注释75的updateLayerStateFromFE(args)
+
+```c++
+//CompositionEngine.cpp
+void CompositionEngine::updateLayerStateFromFE(CompositionRefreshArgs& args) {
+    for (const auto& output : args.outputs) {
+        output->updateLayerStateFromFE(args);
+    }
+}
+//Output.cpp
+void Output::updateLayerStateFromFE(const CompositionRefreshArgs& args) const {
+    for (auto* layer : getOutputLayersOrderedByZ()) {
+        //有新的Layer增加时 mVisibleRegionsDirty 为true,updatingGeometryThisFrame也为true
+        //所以传进去的状态是GeometryAndContent
+        layer->getLayerFE().prepareCompositionState(
+            args.updatingGeometryThisFrame ? LayerFE::StateSubset::GeometryAndContent
+            : LayerFE::StateSubset::Content);
+    }
+}
+//Layer.cpp
+void Layer::prepareCompositionState(compositionengine::LayerFE::StateSubset subset) {
+    using StateSubset = compositionengine::LayerFE::StateSubset;
+	//根据传的状态区分，上面传过来的是GeometryAndContent
+    switch (subset) {
+        case StateSubset::BasicGeometry:
+            prepareBasicGeometryCompositionState();
+            break;
+
+        case StateSubset::GeometryAndContent:
+            //更新BufferLayer状态对象LayerFECompositionState(mCompositionState)的以下属性
+            //outputFilter、isVisible、isOpaque、shadowRadius、contentDirty、geomLayerBounds、geomLayerTransform
+            //geomInverseLayerTransform、transparentRegionHint、blendMode、alpha、backgroundBlurRadius、blurRegions、stretchEffect
+            prepareBasicGeometryCompositionState();
+            //更新以下属性：geomBufferSize、geomContentCrop、geomCrop、geomBufferTransform
+            //geomBufferUsesDisplayInverseTransform|geomUsesSourceCrop、isSecure、metadata
+            //就是集合图形相关的属性
+            prepareGeometryCompositionState();
+            //更新以下属性： compositionType、hdrMetadata、compositionType、buffer、bufferSlot、acquireFence、frameNumber
+            //sidebandStreamHasFrame、forceClientComposition、isColorspaceAgnostic、dataspace、
+            //colorTransform、colorTransformIsIdentity、surfaceDamage、hasProtectedContent、
+            //dimmingEnabled、isOpaque、stretchEffect、blurRegions、backgroundBlurRadius、fps
+            //就是帧数据相关的属性
+            preparePerFrameCompositionState();
+            break;
+
+        case StateSubset::Content:
+            preparePerFrameCompositionState();
+            break;
+
+        case StateSubset::Cursor:
+            prepareCursorCompositionState();
+            break;
+    }
+}
+//只看prepareBasicGeometryCompositionState，另外两个方法类同
+void Layer::prepareBasicGeometryCompositionState() {
+    auto* compositionState = editCompositionState();
+    compositionState->outputFilter = getOutputFilter();
+    compositionState->isVisible = isVisible();
+    compositionState->isOpaque = opaque && !usesRoundedCorners && alpha == 1.f;
+    compositionState->shadowRadius = mEffectiveShadowRadius;
+    compositionState->contentDirty = contentDirty;
+    contentDirty = false;
+
+    compositionState->geomLayerBounds = mBounds;
+    compositionState->geomLayerTransform = getTransform();
+    compositionState->geomInverseLayerTransform = compositionState->geomLayerTransform.inverse();
+    compositionState->transparentRegionHint = getActiveTransparentRegion(drawingState);
+
+    compositionState->blendMode = static_cast<Hwc2::IComposerClient::BlendMode>(blendMode);
+    compositionState->alpha = alpha;
+    compositionState->backgroundBlurRadius = drawingState.backgroundBlurRadius;
+    compositionState->blurRegions = drawingState.blurRegions;
+    compositionState->stretchEffect = getStretchEffect();
+}
+```
+
+updateLayerStateFromFE其实就是把状态属性转移到 BufferLayer.mCompositionState。再看注释76调用每个显示器的present
+
+```c++
+void Output::present(const compositionengine::CompositionRefreshArgs& refreshArgs) {
+    //更新colorMode、dataspace、renderIntent、targetDataspace 属性 
+    updateColorProfile(refreshArgs);
+    //更新forceClientComposition、displayFrame、sourceCrop、bufferTransform、dataspace属性
+    //到这里OutputLayer.mState的属性基本全更新完了
+    updateCompositionState(refreshArgs);
+    //计划合成。需要ro.surface_flinger.enable_layer_caching这个属性为true，mLayerCachingEnabled=true，然后才会启用 Planner
+    planComposition();
+    //77 把状态属性写入HWC待执行的缓存，等待执行
+    writeCompositionState(refreshArgs);
+    //设置显示设备的颜色矩阵，做颜色变换，色盲、护眼模式等
+    setColorTransform(refreshArgs);
+    //给虚拟显示屏用的。正常主屏使用 FramebufferSurface ，啥事也不做
+    beginFrame();
+
+    GpuCompositionResult result;
+    //是否可以预测合成策略--Android 13 新增。正常情况下返回false
+    //如果上次不全是硬件合成，且存在GPU合成Layer时，返回true    
+    const bool predictCompositionStrategy = canPredictCompositionStrategy(refreshArgs);
+    if (predictCompositionStrategy) {
+        //异步执行 chooseCompositionStrategy --Android 13 新增
+        //就是 chooseCompositionStrategy 和 GPU合成 并行执行。用以节约时间
+        result = prepareFrameAsync(refreshArgs);
+    } else {
+        //78 核心逻辑还是确认使用客户端合成还是硬件合成
+        prepareFrame();
+    }
+    //doDebugFlashRegions当打开开发者选项中的“显示Surface刷新”时，额外会产生变化的图层绘制闪烁动画
+    devOptRepaintFlash(refreshArgs);
+    //79 GPU合成，新增了一些对prepareFrameAsync结果的处理逻辑
+    finishFrame(refreshArgs, std::move(result));
+    //80 postFramebuffer 函数就是告诉HWC开始做最后的合成了,并显示。获取释放fence，
+    postFramebuffer();
+    //渲染最新的 cached sets，需要开启了Planner。
+    renderCachedSets(refreshArgs);
+}
+//设置显示设备的颜色矩阵，做颜色变换，色盲、护眼模式等
+void Output::setColorTransform(const compositionengine::CompositionRefreshArgs& args) {
+    auto& colorTransformMatrix = editState().colorTransformMatrix;
+    colorTransformMatrix = *args.colorTransformMatrix;
+    dirtyEntireOutput();
+}
+void Output::dirtyEntireOutput() {
+    auto& outputState = editState();
+    outputState.dirtyRegion.set(outputState.displaySpace.getBoundsAsRect());
+}
+//当打开开发者选项中的“显示Surface刷新”时，额外会产生变化的图层绘制闪烁动画
+void Output::devOptRepaintFlash(const compositionengine::CompositionRefreshArgs& refreshArgs) {
+    if (getState().isEnabled) {
+        if (const auto dirtyRegion = getDirtyRegion(); !dirtyRegion.isEmpty()) {
+            base::unique_fd bufferFence;
+            std::shared_ptr<renderengine::ExternalTexture> buffer;
+            updateProtectedContentState();
+            dequeueRenderBuffer(&bufferFence, &buffer);
+            static_cast<void>(composeSurfaces(dirtyRegion, refreshArgs, buffer, bufferFence));
+            mRenderSurface->queueBuffer(base::unique_fd());
+        }
+    }
+    postFramebuffer();
+    prepareFrame();
+}
+//渲染最新的 cached sets，需要开启了Planner。
+void Output::renderCachedSets(const CompositionRefreshArgs& refreshArgs) {
+    if (mPlanner) {
+        mPlanner->renderCachedSets(getState(), refreshArgs.scheduledFrameTime,
+                                   getState().usesDeviceComposition || getSkipColorTransform());
+    }
+}
+```
+
+Output::present是合成流程里的核心。
+
++ 注释77处writeCompositionState把状态属性写入HWC待执行的缓存，等待执行
++ 注释78处prepareFrame确认使用客户端合成还是硬件合成
++ 注释79处finishFrame通过GPU合成，新增了一些对prepareFrameAsync结果的处理逻辑
++ 注释80处postFramebuffer告诉HWC做最后的合成并显示
+
+先看注释77
+
+```c++
+void Output::writeCompositionState(const compositionengine::CompositionRefreshArgs& refreshArgs) {
+    //...
+    for (auto* layer : getOutputLayersOrderedByZ()) {
+        //如果上一个Layer的buffer和当前的Layer的buffer一样，那么忽略当前Layer
+        if (previousOverride && overrideInfo.buffer->getBuffer() == previousOverride) {
+            skipLayer = true;
+        }
+        //...
+        constexpr bool isPeekingThrough = false;
+        //把状态属性写入HWC待执行的缓存，等待执行
+        layer->writeStateToHWC(includeGeometry, skipLayer, z++, overrideZ, isPeekingThrough);
+    }
+}
+//OutputLayer.cpp
+void OutputLayer::writeStateToHWC(bool includeGeometry, bool skipLayer, uint32_t z,
+                                  bool zIsOverridden, bool isPeekingThrough) {
+    const auto& state = getState();
+    //如果没有HWC接口，直接返回
+    if (!state.hwc) {
+        return;
+    }
+    //如果没有hwcLayer直接返回
+    auto& hwcLayer = (*state.hwc).hwcLayer;
+    if (!hwcLayer) {
+        return;
+    }
+    //获取Layer的LayerFECompositionState,只有BufferLayer和EffectLayer有
+    const auto* outputIndependentState = getLayerFE().getCompositionState();
+    if (!outputIndependentState) {
+        return;
+    }
+    //合成类型
+    auto requestedCompositionType = outputIndependentState->compositionType;
+    const bool isOverridden =
+            state.overrideInfo.buffer != nullptr || isPeekingThrough || zIsOverridden;
+    const bool prevOverridden = state.hwc->stateOverridden;
+    //有忽略的layer，新增的layer，重写的layer等这4种之一
+    if (isOverridden || prevOverridden || skipLayer || includeGeometry) {
+        //写入HWC依赖显示设备的几何图形信息
+        //HWC2::Layer.setDisplayFrame、setSourceCrop、setZOrder、setTransform
+        writeOutputDependentGeometryStateToHWC(hwcLayer.get(), requestedCompositionType, z);
+        // 写入HWC不依赖显示设备的几何图形信息
+        // HWC2::Layer.setBlendMode、setPlaneAlpha、setLayerGenericMetadata
+        writeOutputIndependentGeometryStateToHWC(hwcLayer.get(), *outputIndependentState,
+                                                 skipLayer);
+    }
+    // 写入HWC依赖显示设备的每个帧状态 
+    // HWC2::Layer.etVisibleRegion、setBlockingRegion、setDataspace、setBrightness
+    writeOutputDependentPerFrameStateToHWC(hwcLayer.get());
+    // 写入HWC不依赖显示设备的每帧状态
+    // HWC2::Layer.setColorTransform、setSurfaceDamage、setPerFrameMetadata、setBuffer
+    writeOutputIndependentPerFrameStateToHWC(hwcLayer.get(), *outputIndependentState, skipLayer);
+    // 写入合成类型  HWC2::Layer.setCompositionType
+    writeCompositionTypeToHWC(hwcLayer.get(), requestedCompositionType, isPeekingThrough,
+                              skipLayer);
+    writeSolidColorStateToHWC(hwcLayer.get(), *outputIndependentState);
+
+    editState().hwc->stateOverridden = isOverridden;
+    editState().hwc->layerSkipped = skipLayer;
+}
+//往HWC2::Layer设置了以下：setDisplayFrame、setSourceCrop、setZOrder、setTransform
+//另外3个方法类似，略
+void OutputLayer::writeOutputDependentGeometryStateToHWC(HWC2::Layer* hwcLayer,Composition requestedCompositionType,uint32_t z) {
+    if (auto error = hwcLayer->setDisplayFrame(displayFrame); error != hal::Error::NONE) {}
+    if (auto error = hwcLayer->setSourceCrop(sourceCrop); error != hal::Error::NONE) {}
+    if (auto error = hwcLayer->setZOrder(z); error != hal::Error::NONE) {}
+    
+    const auto bufferTransform = (requestedCompositionType != Composition::SOLID_COLOR &&
+                                  getState().overrideInfo.buffer == nullptr)
+        ? outputDependentState.bufferTransform
+        : static_cast<hal::Transform>(0);
+    if (auto error = hwcLayer->setTransform(static_cast<hal::Transform>(bufferTransform));
+        error != hal::Error::NONE) {}
+}
+```
+
+writeCompositionState把状态属性写入HWC待执行的缓存。  
+
+再看注释78处prepareFrame确认使用客户端合成还是硬件合成。
+
+> 所谓 Client 合成，就是 HWC 的客户端 SurfaceFlinger 去合成，SurfaceFlinger 合成的话使用GPU合成，因此 Client 合成，即GPU合成
+
+```cpp
+void Output::prepareFrame() {
+    auto& outputState = editState();
+    std::optional<android::HWComposer::DeviceRequestedChanges> changes;
+    //81 选择合成策略
+    bool success = chooseCompositionStrategy(&changes);
+    //82 重置合成策略
+    resetCompositionStrategy();
+    outputState.strategyPrediction = CompositionStrategyPredictionState::DISABLED;
+    outputState.previousDeviceRequestedChanges = changes;
+    outputState.previousDeviceRequestedSuccess = success;
+    if (success) {
+        //83 应用合成策略
+        applyCompositionStrategy(changes);
+    }
+    //用于虚拟屏
+    finishPrepareFrame();
+}
+void Output::finishPrepareFrame() {
+    const auto& state = getState();
+    if (mPlanner) {
+        mPlanner->reportFinalPlan(getOutputLayersOrderedByZ());
+    }
+    // 准备帧进行渲染----这里只有虚拟屏幕实现了prepareFrame，其他什么也不做
+    mRenderSurface->prepareFrame(state.usesClientComposition, state.usesDeviceComposition);
+}
+```
+
+prepareFrame同HWC服务交互去确认是否有客户端合成，如果没有客户端合成，并可以忽略验证，那么会直接显示，那么流程到这里基本结束了。我们详细看下注释81-83选择重置应用合成策略的过程。
+
+```c++
+//Display.cpp
+bool Display::chooseCompositionStrategy(
+    std::optional<android::HWComposer::DeviceRequestedChanges>* outChanges) {
+    //...
+    //获取HWC服务
+    auto& hwc = getCompositionEngine().getHwComposer();
+    //最近的一次合成中如果有任意一个layer是 GPU 合成，则返回true
+    const bool requiresClientComposition = anyLayersRequireClientComposition();
+    //调用HWC服务的getDeviceCompositionChanges
+    if (status_t result =
+        hwc.getDeviceCompositionChanges(*halDisplayId, requiresClientComposition,
+                                        getState().earliestPresentTime,
+                                        getState().previousPresentFence,
+                                        getState().expectedPresentTime, outChanges);
+        result != NO_ERROR) {
+        return false;
+    }
+    return true;
+}
+status_t HWComposer::getDeviceCompositionChanges(HalDisplayId displayId...) {
+    // 如果有需要GPU合成的layer， canSkipValidate=false;
+    // 没有需要GPU合成的layer，如果Composer支持获得预期的展示时间，canSkipValidate=true;
+    // 没有需要GPU合成的layer，Composer也不支持获得预期的当前时间，只有当我们知道我们不会提前呈现时，我们才能跳过验证。
+    const bool canSkipValidate = [&] {
+        if (frameUsesClientComposition) {
+            return false;
+        }
+        if (mComposer->isSupported(Hwc2::Composer::OptionalFeature::ExpectedPresentTime)) {
+            return true;
+        }
+        return std::chrono::steady_clock::now() >= earliestPresentTime ||
+            previousPresentFence->getSignalTime() == Fence::SIGNAL_TIME_PENDING;
+    }();
+    
+    if (canSkipValidate) {
+        sp<Fence> outPresentFence;
+        uint32_t state = UINT32_MAX;
+        error = hwcDisplay->presentOrValidate(expectedPresentTime, &numTypes, &numRequests,
+                                              &outPresentFence, &state);
+        if (state == 1) { //Present Succeeded.
+            // 跳过了验证环节，直接显示了。这时直接返回
+            std::unordered_map<HWC2::Layer*, sp<Fence>> releaseFences;
+            error = hwcDisplay->getReleaseFences(&releaseFences);
+            displayData.releaseFences = std::move(releaseFences);
+            displayData.lastPresentFence = outPresentFence;
+            displayData.validateWasSkipped = true;
+            displayData.presentError = error;
+        }
+        if (state == 1) {
+            return NO_ERROR;
+        }
+        acceptChanges = (state != 2);
+    } else {
+        error = hwcDisplay->validate(expectedPresentTime, &numTypes, &numRequests);
+    }
+    
+    
+}
+
+
 ```
 
