@@ -3208,6 +3208,7 @@ void Output::prepareFrame() {
     //82 重置合成策略
     resetCompositionStrategy();
     outputState.strategyPrediction = CompositionStrategyPredictionState::DISABLED;
+    //这个previousDeviceRequestedChanges变量在Output::canPredictCompositionStrategy函数中用来判断是否预测合成策略
     outputState.previousDeviceRequestedChanges = changes;
     outputState.previousDeviceRequestedSuccess = success;
     if (success) {
@@ -3225,9 +3226,16 @@ void Output::finishPrepareFrame() {
     // 准备帧进行渲染----这里只有虚拟屏幕实现了prepareFrame，其他什么也不做
     mRenderSurface->prepareFrame(state.usesClientComposition, state.usesDeviceComposition);
 }
+void Output::resetCompositionStrategy() {
+    //先重置这些变量，在后续的流程中会使用。相当于设置默认值，因为对基本的Output实现只能进行客户端合成
+    auto& outputState = editState();
+    outputState.usesClientComposition = true;
+    outputState.usesDeviceComposition = false;
+    outputState.reusedClientComposition = false;
+}
 ```
 
-prepareFrame同HWC服务交互去确认是否有客户端合成，如果没有客户端合成，并可以忽略验证，那么会直接显示，那么流程到这里基本结束了。我们详细看下注释81-83选择重置应用合成策略的过程。
+prepareFrame同HWC服务交互去确认是否有客户端合成，如果没有客户端合成，并可以忽略验证，那么会直接显示，那么流程到这里基本结束了。我们详细看下注释81和83
 
 ```c++
 //Display.cpp
@@ -3249,10 +3257,11 @@ bool Display::chooseCompositionStrategy(
     }
     return true;
 }
+//HWComposer.cpp
 status_t HWComposer::getDeviceCompositionChanges(HalDisplayId displayId...) {
-    // 如果有需要GPU合成的layer， canSkipValidate=false;
-    // 没有需要GPU合成的layer，如果Composer支持获得预期的展示时间，canSkipValidate=true;
-    // 没有需要GPU合成的layer，Composer也不支持获得预期的当前时间，只有当我们知道我们不会提前呈现时，我们才能跳过验证。
+    //如果有需要GPU合成的layer， canSkipValidate=false;
+    //没有需要GPU合成的layer，如果Composer支持获得预期的展示时间，canSkipValidate=true;
+    //没有需要GPU合成的layer，Composer也不支持获得预期的当前时间，只有当我们知道我们不会提前呈现时，我们才能跳过验证。
     const bool canSkipValidate = [&] {
         if (frameUsesClientComposition) {
             return false;
@@ -3263,32 +3272,257 @@ status_t HWComposer::getDeviceCompositionChanges(HalDisplayId displayId...) {
         return std::chrono::steady_clock::now() >= earliestPresentTime ||
             previousPresentFence->getSignalTime() == Fence::SIGNAL_TIME_PENDING;
     }();
-    
+    //如果可以跳过验证就跳过，否则执行validate验证
     if (canSkipValidate) {
         sp<Fence> outPresentFence;
         uint32_t state = UINT32_MAX;
+        //如果可以跳过验证，则直接在屏幕上显示内容,否则执行 validate
+        //HWC会检查各个图层的状态，并确定如何进行合成
         error = hwcDisplay->presentOrValidate(expectedPresentTime, &numTypes, &numRequests,
                                               &outPresentFence, &state);
+        // state = 0 --> Only Validate.
+        // state = 1 --> Validate and commit succeeded. Skip validate case. No comp changes.
+        // state = 2 --> Validate and commit succeeded. Query Comp changes.
         if (state == 1) { //Present Succeeded.
-            // 跳过了验证环节，直接显示了。这时直接返回
+            //返回状态为1直接显示并返回，结束此流程
             std::unordered_map<HWC2::Layer*, sp<Fence>> releaseFences;
             error = hwcDisplay->getReleaseFences(&releaseFences);
             displayData.releaseFences = std::move(releaseFences);
             displayData.lastPresentFence = outPresentFence;
             displayData.validateWasSkipped = true;
             displayData.presentError = error;
-        }
-        if (state == 1) {
             return NO_ERROR;
         }
-        acceptChanges = (state != 2);
     } else {
+        //HWC 检查各个图层的状态，并确定如何进行合成
+        //numTypes返回合成类型需要变更的layer数量
+        //numRequests 返回需要做getDisplayRequests请求的layer数量
         error = hwcDisplay->validate(expectedPresentTime, &numTypes, &numRequests);
     }
-    
-    
+
+    //ChangedTypes =std::unordered_map<HWC2::Layer*,
+    //              aidl::android::hardware::graphics::composer3::Composition>;
+    //composer3::Composition 为枚举类型：
+    //{INVALID = 0, CLIENT = 1,  DEVICE = 2,  SOLID_COLOR = 3,  CURSOR = 4,  SIDEBAND = 5,  DISPLAY_DECORATION = 6,}; 
+    //changedTypes即是map<Layer,Composition> 
+    android::HWComposer::DeviceRequestedChanges::ChangedTypes changedTypes;
+    //map扩容为numTypes
+    changedTypes.reserve(numTypes);
+    //返回包含所有与上次调用validateDisplay之前设置的合成类型不同的合成类型的Layer
+    error = hwcDisplay->getChangedCompositionTypes(&changedTypes);
+
+    //枚举hal::DisplayRequest{FLIP_CLIENT_TARGET = 1u , WRITE_CLIENT_TARGET_TO_OUTPUT = 2u}
+    //0表示：指示客户端提供新的客户端目标缓冲区，即使没有为客户端合成标记任何layers。
+    //1表示：指示客户端将客户端合成的结果直接写入虚拟显示输出缓冲区。
+    auto displayRequests = static_cast<hal::DisplayRequest>(0);
+    //LayerRequests = std::unordered_map<HWC2::Layer*, hal::LayerRequest>;
+    //枚举 hal::LayerRequest{CLEAR_CLIENT_TARGET = 1 << 0,  }
+    //1表示：客户端必须在该layer所在的位置使用透明像素清除其目标。如果必须混合该层，客户端可能会忽略此请求。
+    android::HWComposer::DeviceRequestedChanges::LayerRequests layerRequests;
+    //map扩容为numRequests
+    layerRequests.reserve(numRequests);
+    //返回hal::DisplayRequest和每个Layer的hal::LayerRequest类型，用于指导SurfaceFlinger的GPU合成
+    error = hwcDisplay->getRequests(&displayRequests, &layerRequests);
+    //返回clienttarget属性，这个新增的，目前可能仅仅实现了亮度、调光、数据格式、数据空间相关属性
+    DeviceRequestedChanges::ClientTargetProperty clientTargetProperty;
+    error = hwcDisplay->getClientTargetProperty(&clientTargetProperty);
+    //组合成DeviceRequestedChanges结构体，返回
+    outChanges->emplace(DeviceRequestedChanges{std::move(changedTypes), std::move(displayRequests),
+                                               std::move(layerRequests),
+                                               std::move(clientTargetProperty)});
+    if (acceptChanges) {
+        error = hwcDisplay->acceptChanges();
+    }
+    return NO_ERROR;
 }
-
-
 ```
 
+chooseCompositionStrategy会先判断是否跳过校验，如果需要跳过，就执行hwcDisplay->presentOrValidate，如果返回状态为1就直接显示，结束此流程，否则组合个DeviceRequestedChanges返回。再看注释83处applyCompositionStrategy
+
+```c++
+void Display::applyCompositionStrategy(const std::optional<DeviceRequestedChanges>& changes) {
+    if (changes) {
+        //应用注释81处组合的DeviceRequestedChanges结构体里的这几个参数
+        applyChangedTypesToLayers(changes->changedTypes);
+        applyDisplayRequests(changes->displayRequests);
+        applyLayerRequestsToLayers(changes->layerRequests);
+        applyClientTargetRequests(changes->clientTargetProperty);
+    }
+
+    // Determine what type of composition we are doing from the final state
+    auto& state = editState();
+    state.usesClientComposition = anyLayersRequireClientComposition();
+    state.usesDeviceComposition = !allLayersRequireClientComposition();
+}
+void Display::applyChangedTypesToLayers(const ChangedTypes& changedTypes) {
+    for (auto* layer : getOutputLayersOrderedByZ()) {
+        //获取OutputLayer中存储的HWC::Layer
+        auto hwcLayer = layer->getHwcLayer();
+        if (auto it = changedTypes.find(hwcLayer); it != changedTypes.end()) {
+            //应用HWC设备要求的合成类型更改
+            layer->applyDeviceCompositionTypeChange(
+                static_cast<aidl::android::hardware::graphics::composer3::Composition>(
+                    it->second));
+        }
+    }
+}
+//应用设备合成类型变更
+void OutputLayer::applyDeviceCompositionTypeChange(Composition compositionType) {
+    auto& state = editState();
+    auto& hwcState = *state.hwc;
+    if (!hwcState.layerSkipped) {
+        detectDisallowedCompositionTypeChange(hwcState.hwcCompositionType, compositionType);
+    }
+    //这个OutputLayerCompositionState::Hwc.hwcCompositionType用于预测合成策略 Output::canPredictCompositionStrategy
+    //compositionType代表最近使用的合成类型
+    hwcState.hwcCompositionType = compositionType;
+}
+void Display::applyDisplayRequests(const DisplayRequests& displayRequests) {
+    auto& state = editState();
+    //如果displayRequests包含flag FLIP_CLIENT_TARGET，则flipClientTarget=true
+    //如果为true，则在执行客户端合成时应提供新的客户端目标(client target)缓冲区
+    state.flipClientTarget = (static_cast<uint32_t>(displayRequests) &
+                              static_cast<uint32_t>(hal::DisplayRequest::FLIP_CLIENT_TARGET)) != 0;
+}
+void Display::applyLayerRequestsToLayers(const LayerRequests& layerRequests) {
+    for (auto* layer : getOutputLayersOrderedByZ()) {
+        layer->prepareForDeviceLayerRequests();
+        auto hwcLayer = layer->getHwcLayer();
+        if (auto it = layerRequests.find(hwcLayer); it != layerRequests.end()) {
+            //应用HWC的layer请求,只是把state.clearClientTarget设为true
+            layer->applyDeviceLayerRequest(
+                static_cast<Hwc2::IComposerClient::LayerRequest>(it->second));
+        }
+    }
+}
+void OutputLayer::applyDeviceLayerRequest(hal::LayerRequest request) {
+    auto& state = editState();
+    switch (request) {
+        case hal::LayerRequest::CLEAR_CLIENT_TARGET:
+            //客户端合成时，该layer所在的位置使用透明像素清除其目标
+            state.clearClientTarget = true;
+            break;
+        default:
+            break;
+    }
+}
+void Display::applyClientTargetRequests(const ClientTargetProperty& clientTargetProperty) {
+    editState().dataspace =
+        static_cast<ui::Dataspace>(clientTargetProperty.clientTargetProperty.dataspace);
+    editState().clientTargetBrightness = clientTargetProperty.brightness;
+    editState().clientTargetDimmingStage = clientTargetProperty.dimmingStage;
+    getRenderSurface()->setBufferDataspace(editState().dataspace);
+    getRenderSurface()->setBufferPixelFormat(
+        static_cast<ui::PixelFormat>(clientTargetProperty.clientTargetProperty.pixelFormat));
+}
+```
+
+applyCompositionStrategy只是把chooseCompositionStrategy组合的DeviceRequestedChanges里的参数分别应用到State中。再继续看注释79处finishFrame处理Client合成（GPU合成）
+
+```c++
+void Output::finishFrame(const CompositionRefreshArgs& refreshArgs, GpuCompositionResult&& result) {
+    const auto& outputState = getState();
+    std::optional<base::unique_fd> optReadyFence;
+    std::shared_ptr<renderengine::ExternalTexture> buffer;
+    base::unique_fd bufferFence;
+    //上面如果走prepareFrame()，则outputState.strategyPrediction为DISABLED，表示不使用预测合成策略
+    //走prepareFrameAsync()为SUCCESS或者FAIL表示合预测成功或者失败
+    if (outputState.strategyPrediction == CompositionStrategyPredictionState::SUCCESS) {
+        //如果预测成功，则已经执行完 GPU 合成了，不必再dequeueRenderBuffer了
+        optReadyFence = std::move(result.fence);
+    } else {
+        //虽然预测失败了，但是已经dequeued的buffer，会通过GpuCompositionResult传送过来，拿来复用
+        if (result.bufferAvailable()) {
+            buffer = std::move(result.buffer);
+            bufferFence = std::move(result.fence);
+        } else {
+            //dequeueRenderBuffer失败，连dequeued的buffer都没有，那就重走一遍prepareFrameAsync GPU合成的那块逻辑。当然，也可能就没有执行 prepareFrameAsync
+            updateProtectedContentState();
+            //BufferQueue的dequeueBuffer操作
+            if (!dequeueRenderBuffer(&bufferFence, &buffer)) {
+                return;
+            }
+        }
+        //84 执行GPU合成
+        optReadyFence = composeSurfaces(Region::INVALID_REGION, refreshArgs, buffer, bufferFence);
+    }
+
+    //BufferQueue的queueBuffer操作
+    mRenderSurface->queueBuffer(std::move(*optReadyFence));
+}
+
+bool Output::dequeueRenderBuffer(base::unique_fd* bufferFence,
+                                 std::shared_ptr<renderengine::ExternalTexture>* tex) {
+    const auto& outputState = getState();
+    //有使用客户端合成或者设置了flipClientTarget都需要进行GPU合成
+    if (outputState.usesClientComposition || outputState.flipClientTarget) {
+        //dequeueBuffer，然后把dequeue的Buffer包装为ExternalTexture
+        *tex = mRenderSurface->dequeueBuffer(bufferFence);
+        if (*tex == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+std::shared_ptr<renderengine::ExternalTexture> RenderSurface::dequeueBuffer(base::unique_fd* bufferFence) {
+    //调用Surface.dequeueBuffer,前面小节说过，Surface即ANativeWindow
+    status_t result = mNativeWindow->dequeueBuffer(mNativeWindow.get(), &buffer, &fd);
+    // GraphicBuffer继承ANativeWindowBuffer
+    // GraphicBuffer::from 把父类ANativeWindowBuffer强制转换为子类GraphicBuffer
+    sp<GraphicBuffer> newBuffer = GraphicBuffer::from(buffer);
+    std::shared_ptr<renderengine::ExternalTexture> texture;
+    //...
+    //ExternalTexture使用RenderEngine代表客户端管理GPU图像资源。
+    //渲染引擎不是GLES的话，在ExternalTexture构造函数中把GraphicBuffer映射到RenderEngine所需的GPU资源中。
+    mTexture = std::make_shared<
+        renderengine::impl::ExternalTexture>(GraphicBuffer::from(buffer),
+                                             mCompositionEngine.getRenderEngine(),
+                                             renderengine::impl::ExternalTexture::Usage::
+                                             WRITEABLE);
+
+    mTextureCache.push_back(mTexture);
+    if (mTextureCache.size() > mMaxTextureCacheSize) {
+        mTextureCache.erase(mTextureCache.begin());
+    }
+    //返回fence fd
+    *bufferFence = base::unique_fd(fd);
+    // 返回纹理类
+    return mTexture;
+}
+void RenderSurface::queueBuffer(base::unique_fd readyFence) {
+    auto& state = mDisplay.getState();
+    if (state.usesClientComposition || state.flipClientTarget || mFlipClientTarget) {
+        //调用Surface.queueBuffer
+        status_t result =
+            mNativeWindow->queueBuffer(mNativeWindow.get(),
+                                       mTexture->getBuffer()->getNativeBuffer(),
+                                       mFlipClientTarget ? -1 : dup(readyFence));
+        //...
+        mTexture = nullptr;
+    }
+    //对于非虚拟屏是FramebufferSurface，其包装消费者、继承DisplaySurface；
+    //对于虚拟屏是VirtualDisplaySurface
+    status_t result = mDisplaySurface->advanceFrame();
+}
+//FramebufferSurface.cpp
+status_t FramebufferSurface::advanceFrame() {
+    uint32_t slot = 0;
+    sp<GraphicBuffer> buf;
+    sp<Fence> acquireFence(Fence::NO_FENCE);
+    Dataspace dataspace = Dataspace::UNKNOWN;
+    status_t result = nextBuffer(slot, buf, acquireFence, dataspace);
+    return result;
+}
+status_t FramebufferSurface::nextBuffer(uint32_t& outSlot,
+        sp<GraphicBuffer>& outBuffer, sp<Fence>& outFence,
+        Dataspace& outDataspace) {
+	//...
+    //把客户端合成输出的缓冲区句柄传递给HWC。
+    //目前还未真正传递到HWC，只是写到命令缓冲区。需要等待执行 present 才执行传递
+    status_t result = mHwc.setClientTarget(mDisplayId, outSlot, outFence, outBuffer, outDataspace);
+    //...
+    return NO_ERROR;
+}
+```
+
+注释84处composeSurfaces是GPU合成的核心
