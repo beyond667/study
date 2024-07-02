@@ -3525,4 +3525,116 @@ status_t FramebufferSurface::nextBuffer(uint32_t& outSlot,
 }
 ```
 
-注释84处composeSurfaces是GPU合成的核心
+注释84处composeSurfaces是GPU合成的核心，后面详细讲。先继续看注释80处postFramebuffer告诉HWC做最后的合成并显示
+
+```cpp
+//Output.h
+struct FrameFences {
+    //这个fence，在当前帧在屏幕上显现，或者发送到面板内存时，会发送信号
+    sp<Fence> presentFence{Fence::NO_FENCE};
+    //GPU 合成的buffer的消费者 acquire fence；代表GPU合成是否完成；(注：GPU绘制的acquire fence，在latchBuffer阶段已经判断了。)
+    sp<Fence> clientTargetAcquireFence{Fence::NO_FENCE};
+    //所有Layer的fence；在先前呈现的buffer被读取完成后发送信息；HWC生成
+    std::unordered_map<HWC2::Layer*, sp<Fence>> layerFences;
+};
+//Output.cpp
+void Output::postFramebuffer() {
+    auto& outputState = editState();
+    outputState.dirtyRegion.clear();
+    mRenderSurface->flip();
+    //显示并获取FrameFences
+    auto frame = presentAndGetFrameFences();
+    //释放GPU合成使用的buffer
+    mRenderSurface->onPresentDisplayCompleted();
+    for (auto* layer : getOutputLayersOrderedByZ()) {
+        sp<Fence> releaseFence = Fence::NO_FENCE;
+        // 获取HWC每个layer的releaseFence
+        if (auto hwcLayer = layer->getHwcLayer()) {
+            if (auto f = frame.layerFences.find(hwcLayer); f != frame.layerFences.end()) {
+                releaseFence = f->second;
+            }
+        }
+        //如果有客户端合成，merge GPUbuffer的fence
+        if (outputState.usesClientComposition) {
+            releaseFence =Fence::merge("LayerRelease", releaseFence, frame.clientTargetAcquireFence);
+        }
+        //同步Fence到Layer中
+        //如果是BufferQueueLayer设置mSlots[slot].mFence; 
+        //如果是BufferStateLayer把fence关联到回调类中
+        layer->getLayerFE().onLayerDisplayed(ftl::yield<FenceResult>(std::move(releaseFence)).share());
+    }
+    //mReleasedLayers是一些即将移除的的layer，但是当前vsync还在生产帧数据的layer
+    //把presentFence传给这些layer使用，毕竟他们不参与合成了
+    for (auto& weakLayer : mReleasedLayers) {
+        if (const auto layer = weakLayer.promote()) {
+            layer->onLayerDisplayed(ftl::yield<FenceResult>(frame.presentFence).share());
+        }
+    }
+    //清空mReleasedLayers
+    mReleasedLayers.clear();
+}
+//Display.cpp
+compositionengine::Output::FrameFences Display::presentAndGetFrameFences() {
+    //这里赋值FrameFences.clientTargetAcquireFence
+    auto fences = impl::Output::presentAndGetFrameFences();
+    endDraw();
+    auto& hwc = getCompositionEngine().getHwComposer();
+    //在屏幕上呈现当前显示内容（如果是虚拟显示，则显示到输出缓冲区中）
+    //获取device上所有layer的 ReleaseFence
+    hwc.presentAndGetReleaseFences(*halDisplayIdOpt, getState().earliestPresentTime,
+                                   getState().previousPresentFence);
+    //getPresentFence返回 HWComposer.mDisplayData.at(displayId).lastPresentFence;
+    //这个fence，在当前帧在屏幕上显现，或者发送到面板内存时，会发送信号
+    //这里赋值FrameFences.presentFence
+    fences.presentFence = hwc.getPresentFence(*halDisplayIdOpt);
+    for (const auto* layer : getOutputLayersOrderedByZ()) {
+        auto hwcLayer = layer->getHwcLayer();
+        if (!hwcLayer) {
+            continue;
+        }
+        //把HWC显示设备上所有Layer的fence赋值给FrameFences.layerFences
+        fences.layerFences.emplace(hwcLayer, hwc.getLayerReleaseFence(*halDisplayIdOpt, hwcLayer));
+    }
+    hwc.clearReleaseFences(*halDisplayIdOpt);
+    return fences;
+}
+```
+
+postFramebuffer调用hwc.presentAndGetReleaseFences来让屏幕显示当前内容，然后构建了FrameFences。到这里合成工作就完成了，即注释73处mCompositionEngine->present已完成。再继续看注释74合成后的收尾工作postComposition
+
+```cpp
+//SurfaceFlinger.cpp
+void SurfaceFlinger::postComposition() {
+    //...
+    for (const auto& layer: mLayersWithQueuedFrames) {
+        //更新FrameTracker、TimeStats这些
+        layer->onPostComposition(display, glCompositionDoneFenceTime,
+                                 mPreviousPresentFences[0].fenceTime, compositorTiming);
+        layer->releasePendingBuffer(/*dequeueReadyTime*/ now);
+    }
+    //...
+    mTransactionCallbackInvoker.addPresentFence(mPreviousPresentFences[0].fence);
+    //这里就是通过binder通信，回调到 APP 端BBQ执行 releaseBuffer 了
+    mTransactionCallbackInvoker.sendCallbacks(false /* onCommitOnly */);
+    mTransactionCallbackInvoker.clearCompletedTransactions();
+}
+
+//BufferStateLayer.cpp
+void BufferStateLayer::releasePendingBuffer(nsecs_t dequeueReadyTime) {
+    //...
+    for (auto& handle : mDrawingState.callbackHandles) {
+        if (handle->releasePreviousBuffer &&
+            mDrawingState.releaseBufferEndpoint == handle->listener) {
+            //这个mPreviousReleaseCallbackId 在 BufferStateLayer::updateActiveBuffer() 赋值
+            //mPreviousReleaseCallbackId = {getCurrentBufferId(), mBufferInfo.mFrameNumber};
+            handle->previousReleaseCallbackId = mPreviousReleaseCallbackId;
+            break;
+        }
+    }
+    //...
+    //把callback 加入 TransactionCallbackInvoker::mCompletedTransactions
+    mFlinger->getTransactionCallbackInvoker().addCallbackHandles(mDrawingState.callbackHandles, jankData);
+    //...
+}
+```
+
