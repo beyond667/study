@@ -2748,7 +2748,7 @@ void SurfaceFlinger::composite(nsecs_t frameTime, int64_t vsyncId)
     //这种写法没看懂，从上下文理解应该是通过binder拿到所有的显示设备
     //合成是以mDisplays里面的顺序去合成的，内置的显示器是在开机时就加入的，所以优先于外部显示器
     const auto& displays = FTL_FAKE_GUARD(mStateLock, mDisplays);
-    // 增加容器的大小为显示屏的大小
+    //增加容器的大小为显示屏的大小
     refreshArgs.outputs.reserve(displays.size());
     std::vector<DisplayId> displayIds;
     //遍历所有的显示器，调用每个getCompositionDisplay方法，获取需要合成的显示器
@@ -3197,7 +3197,7 @@ writeCompositionState把状态属性写入HWC待执行的缓存。
 
 再看注释78处prepareFrame确认使用客户端合成还是硬件合成。
 
-> 所谓 Client 合成，就是 HWC 的客户端 SurfaceFlinger 去合成，SurfaceFlinger 合成的话使用GPU合成，因此 Client 合成，即GPU合成
+> 所谓 Client 合成，就是 HWC 的客户端SurfaceFlinger去合成，SurfaceFlinger合成的话使用GPU合成，因此Client合成，即GPU合成
 
 ```cpp
 void Output::prepareFrame() {
@@ -3613,8 +3613,7 @@ void SurfaceFlinger::postComposition() {
         layer->releasePendingBuffer(/*dequeueReadyTime*/ now);
     }
     //...
-    mTransactionCallbackInvoker.addPresentFence(mPreviousPresentFences[0].fence);
-    //这里就是通过binder通信，回调到 APP 端BBQ执行 releaseBuffer 了
+    //通过binder通信，回调到APP端BBQ执行releaseBuffer了
     mTransactionCallbackInvoker.sendCallbacks(false /* onCommitOnly */);
     mTransactionCallbackInvoker.clearCompletedTransactions();
 }
@@ -3636,5 +3635,143 @@ void BufferStateLayer::releasePendingBuffer(nsecs_t dequeueReadyTime) {
     mFlinger->getTransactionCallbackInvoker().addCallbackHandles(mDrawingState.callbackHandles, jankData);
     //...
 }
+//TransactionCallbackInvoker.cpp
+void TransactionCallbackInvoker::sendCallbacks(bool onCommitOnly) {
+    //...
+    //回调binder的onTransactionCompleted方法
+    callbacks.emplace_back([stats = std::move(listenerStats)]() {
+        interface_cast<ITransactionCompletedListener>(stats.listener)
+            ->onTransactionCompleted(stats);
+    });
+    //...
+}
 ```
 
+postComposition通过binder调用到客户端的onTransactionCompleted方法。此回调在客户端调用SF进程的acquireNextBufferLocked方法里定义
+
+```c++
+void BLASTBufferQueue::acquireNextBufferLocked(
+    const std::optional<SurfaceComposerClient::Transaction*> transaction) {
+    //...
+    auto releaseBufferCallback =
+        std::bind(releaseBufferCallbackThunk, wp<BLASTBufferQueue>(this) /* callbackContext */,
+                  std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
+    sp<Fence> fence = bufferItem.mFence ? new Fence(bufferItem.mFence->dup()) : Fence::NO_FENCE;
+    t->setBuffer(mSurfaceControl, buffer, fence, bufferItem.mFrameNumber, releaseBufferCallback);
+    //...
+}
+```
+
+其实会回调releaseBufferCallbackThunk方法，此时已经回调到客户端进程。
+
+```cpp
+//BLASTBufferQueue.cpp
+static void releaseBufferCallbackThunk(wp<BLASTBufferQueue> context, const ReleaseCallbackId& id,
+                                       const sp<Fence>& releaseFence,
+                                       std::optional<uint32_t> currentMaxAcquiredBufferCount) {
+    sp<BLASTBufferQueue> blastBufferQueue = context.promote();
+    if (blastBufferQueue) {
+        blastBufferQueue->releaseBufferCallback(id, releaseFence, currentMaxAcquiredBufferCount);
+    } 
+}
+void BLASTBufferQueue::releaseBufferCallback(
+    const ReleaseCallbackId& id, const sp<Fence>& releaseFence,
+    std::optional<uint32_t> currentMaxAcquiredBufferCount) {
+    releaseBufferCallbackLocked(id, releaseFence, currentMaxAcquiredBufferCount);
+}
+void BLASTBufferQueue::releaseBufferCallbackLocked(const ReleaseCallbackId& id,
+                                                   const sp<Fence>& releaseFence, std::optional<uint32_t> currentMaxAcquiredBufferCount) {
+
+    //...
+    //ReleaseCallbackId 是个包含 bufferId 和 帧号 的Parcelable, ReleasedBuffer结构体又把 releaseFence 包含进来
+    auto rb = ReleasedBuffer{id, releaseFence};
+    //队列里边没有的话，就加入队列
+    if (std::find(mPendingRelease.begin(), mPendingRelease.end(), rb) == mPendingRelease.end()) {
+        mPendingRelease.emplace_back(rb);
+    }
+    //numPendingBuffersToHold是需要保留的buffer数量
+    while (mPendingRelease.size() > numPendingBuffersToHold) {
+        const auto releasedBuffer = mPendingRelease.front();
+        mPendingRelease.pop_front();
+        //释放buffer
+        releaseBuffer(releasedBuffer.callbackId, releasedBuffer.releaseFence);
+        if (mSyncedFrameNumbers.empty()) {
+            acquireNextBufferLocked(std::nullopt);
+        }
+    }
+    //...
+}
+
+void BLASTBufferQueue::releaseBuffer(const ReleaseCallbackId& callbackId,
+                                     const sp<Fence>& releaseFence) {
+    //mSubmitted是个map<ReleaseCallbackId, BufferItem>，从这个map中查找对应的 BufferItem
+    auto it = mSubmitted.find(callbackId);
+    mNumAcquired--;
+    mNumUndequeued++;
+    mBufferItemConsumer->releaseBuffer(it->second, releaseFence);
+    mSubmitted.erase(it);
+    mSyncedFrameNumbers.erase(callbackId.framenumber);
+}
+//BufferItemConsumer.cpp
+status_t BufferItemConsumer::releaseBuffer(const BufferItem &item,
+                                           const sp<Fence>& releaseFence) {
+    status_t err;
+    //mSlots[slot].mFence = fence; 赋值releaseFence，并处理Fence合并情况
+    err = addReleaseFenceLocked(item.mSlot, item.mGraphicBuffer, releaseFence);
+    //调用消费者的releaseBuffer方法
+    err = releaseBufferLocked(item.mSlot, item.mGraphicBuffer, EGL_NO_DISPLAY,
+                              EGL_NO_SYNC_KHR);
+    return err;
+}
+//调用父类ConsumerBase.cpp的releaseBufferLocked
+status_t ConsumerBase::releaseBufferLocked(
+        int slot, const sp<GraphicBuffer> graphicBuffer,
+        EGLDisplay display, EGLSyncKHR eglFence) {
+    //...
+    //调用消费者的releaseBuffer方法
+    status_t err = mConsumer->releaseBuffer(slot, mSlots[slot].mFrameNumber,
+                                            display, eglFence, mSlots[slot].mFence);
+    //如果返回buffer过时了，需要清空这个slot的 GraphicBuffer
+    if (err == IGraphicBufferConsumer::STALE_BUFFER_SLOT) {
+        freeBufferLocked(slot);
+    }
+
+    mPrevFinalReleaseFence = mSlots[slot].mFence;
+    // 这里的mSlots是BufferItem的，和 BufferQueue 的不是一个变量
+    // BufferItem 的Fence设置为 NO_FENCE
+    mSlots[slot].mFence = Fence::NO_FENCE;
+}
+//BufferQueueConsumer.cpp
+status_t BufferQueueConsumer::releaseBuffer(int slot, uint64_t frameNumber,
+                                            const sp<Fence>& releaseFence, EGLDisplay eglDisplay,
+                                            EGLSyncKHR eglFence) {
+    sp<IProducerListener> listener;
+    //display = EGL_NO_DISPLAY;
+    mSlots[slot].mEglDisplay = eglDisplay;
+    //EGLSyncKHR eglFence = EGL_NO_SYNC_KHR
+    mSlots[slot].mEglFence = eglFence;
+    //SurfaceFlinger 传递过来的 releaseFence
+    mSlots[slot].mFence = releaseFence;
+    //状态转为 released
+    mSlots[slot].mBufferState.release();
+    //从激活状态set中删除
+    mCore->mActiveBuffers.erase(slot);
+    //放回 Free list 中
+    mCore->mFreeBuffers.push_back(slot);
+    if (mCore->mBufferReleasedCbEnabled) {
+        // mConnectedProducerListener 是 BufferQueueProducer::connect 时传入的
+        // CPU绘制传入的 StubProducerListener,没啥用
+        listener = mCore->mConnectedProducerListener;
+    }
+    //如果有阻塞在dequeuebuffer的线程，此时会被唤醒，有新的buffer可以 Dequeue 了
+    mCore->mDequeueCondition.notify_all();
+    if (listener != nullptr) {
+        //对于CPU绘制，这个是空函数没啥
+        listener->onBufferReleased();
+    }
+}
+```
+
+其实就是调用了消费者的releaseBuffer，如果有阻塞在dequeuebuffer的线程，此时会被唤醒。  
+
+小结：SurfaceFlinger的合成会先构建合成需要的参数refreshArgs，把SF里保存的layer等信息传进去，再调用合成引擎的present方法。此方法会遍历所有的显示设备output，调用其prepare和present方法，其中prepare方法会从顶层到底层遍历所有的Layer，把不需要参与合成的layer放到mReleasedLayers中。present方法会调用prepareFrame通过HWC服务去确认是用客户端合成还是硬件合成，如果由硬件合成，合成流程直接结束，否则会在finishFrame里处理客户端合成，即GPU合成，这里会调用composeSurfaces去真正处理GPU合成，然后会postFramebuffer告诉HWC做最后的合成并显示，这里会调用hwc的presentAndGetReleaseFences先展示已经要显示的帧（FrameFences.presentFence），然后把当前的帧赋值到此字段，等待下一个vsync信号后再展示。合成完后会在postComposition通过binder调用到客户端的onTransactionCompleted方法，这里会调用BBQ的releaseBuffer方法，其会调用消费者的releaseBuffer，释放完后把slot放到空闲队列，如果有线程阻塞在dequeuebuffer的，此时会被唤醒。
