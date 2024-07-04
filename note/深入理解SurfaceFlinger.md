@@ -205,7 +205,7 @@ void SurfaceFlinger::init() {
 }
 ```
 
-里面会先对CompositionEngine设置RenderEngine和HwComposer（通过HAL层的HWComposer硬件模块或者软件模拟产生Vsync信号），再看注释4处`processDisplayHotplugEventsLocked`方法
+里面会先对CompositionEngine设置RenderEngine和HwComposer（通过HAL层的HWComposer硬件模块或者软件模拟产生Vsync信号），再看注释4处`processDisplayHotplugEventsLocked`方法 **创建与初始化FramebufferSurface和initScheduler流程**
 
 ```c++
 void SurfaceFlinger::processDisplayHotplugEventsLocked() {
@@ -243,14 +243,111 @@ void SurfaceFlinger::processDisplayChangesLocked() {
 void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
                                          const DisplayDeviceState& state) {
     //...
+    sp<compositionengine::DisplaySurface> displaySurface;
+    sp<IGraphicBufferProducer> producer;
+    sp<IGraphicBufferProducer> bqProducer;
+    sp<IGraphicBufferConsumer> bqConsumer;
+    //创建BufferQueue,获取到生产者和消费者
+    getFactory().createBufferQueue(&bqProducer, &bqConsumer, false);
+    //5-1 创建了FramebufferSurface对象，FramebufferSurface继承自compositionengine::DisplaySurface
+    //FramebufferSurface是作为消费者的角色工作的，消费SF GPU合成后的图形数据
+    displaySurface = sp<FramebufferSurface>::make(getHwComposer(), *displayId, bqConsumer,
+                                     state.physical->activeMode->getResolution(),
+                                     ui::Size(maxGraphicsWidth, maxGraphicsHeight));
+    producer = bqProducer;
+    //5-2 创建DisplayDevice，其又去创建RenderSurface，作为生产者角色工作，displaySurface就是FramebufferSurface对象
+    auto display = setupNewDisplayDeviceInternal(displayToken, std::move(compositionDisplay), state,displaySurface, producer);
+
     if (display->isPrimary()) {
-        //5 进行Scheduler初始化
+        //5-3 进行Scheduler初始化
         initScheduler(display);
     }
 }
 ```
 
-注释5处执行initScheduler初始化Scheduler
++ 注释5-1处创建并初始化了FramebufferSurface，其作为消费者消费SF GPU合成后的图形数据
+
++ 注释5-2处创建DisplayDevice，其又去创建RenderSurface，作为生产者角色工作，这里把注释5-1创建的FramebufferSurface传进去
+
++ 注释5-3处执行initScheduler初始化Scheduler
+
+先看注释5-1和2处
+
+```c++
+//FramebufferSurface.cpp
+//其构造函数主要对传进来的消费者进行了初始化
+FramebufferSurface::FramebufferSurface(HWComposer& hwc, PhysicalDisplayId displayId,
+                                       const sp<IGraphicBufferConsumer>& consumer,
+                                       const ui::Size& size, const ui::Size& maxSize){
+    mName = "FramebufferSurface";
+    mConsumer->setConsumerName(mName);
+    mConsumer->setConsumerUsageBits(GRALLOC_USAGE_HW_FB |
+                                       GRALLOC_USAGE_HW_RENDER |
+                                       GRALLOC_USAGE_HW_COMPOSER);
+    const auto limitedSize = limitSize(size);
+    mConsumer->setDefaultBufferSize(limitedSize.width, limitedSize.height);
+    mConsumer->setMaxAcquiredBufferCount(
+            SurfaceFlinger::maxFrameBufferAcquiredBuffers - 1);
+}
+sp<DisplayDevice> SurfaceFlinger::setupNewDisplayDeviceInternal(...){
+    //创建DisplayDevice构造时需的参数
+    DisplayDeviceCreationArgs creationArgs(this, getHwComposer(), displayToken, compositionDisplay);
+    //displaySurface即FramebufferSurface
+    creationArgs.displaySurface = displaySurface;
+    //producer是前面processDisplayAdded中创建的
+    auto nativeWindowSurface = getFactory().createNativeWindowSurface(producer);
+    auto nativeWindow = nativeWindowSurface->getNativeWindow();
+    creationArgs.nativeWindow = nativeWindow;
+    //...省略构建其他参数过程
+    
+	//根据上面构建的参数创建DisplayDevice
+    //creationArgs.nativeWindow会把前面创建的producer关联到了DisplayDevice
+    sp<DisplayDevice> display = getFactory().createDisplayDevice(creationArgs);
+}
+
+DisplayDevice::DisplayDevice(DisplayDeviceCreationArgs& args){
+    mCompositionDisplay->editState().isSecure = args.isSecure;
+    //创建RenderSurface，args.nativeWindow 即为producer,指向生产者
+    mCompositionDisplay->createRenderSurface(
+        compositionengine::RenderSurfaceCreationArgsBuilder()
+        .setDisplayWidth(ANativeWindow_getWidth(args.nativeWindow.get()))
+        .setDisplayHeight(ANativeWindow_getHeight(args.nativeWindow.get()))
+        .setNativeWindow(std::move(args.nativeWindow))
+        .setDisplaySurface(std::move(args.displaySurface))
+        .setMaxTextureCacheSize(
+            static_cast<size_t>(SurfaceFlinger::maxFrameBufferAcquiredBuffers))
+        .build());
+    //...
+    //执行initialize初始化RenderSurface
+    mCompositionDisplay->getRenderSurface()->initialize();
+}
+//RenderSurface.cpp
+RenderSurface::RenderSurface(const CompositionEngine& compositionEngine, Display& display,
+                             const RenderSurfaceCreationArgs& args)
+      : mCompositionEngine(compositionEngine),
+        mDisplay(display),
+		//指向生产者
+        mNativeWindow(args.nativeWindow),
+		//即FramebufferSurface,指向消费者
+        mDisplaySurface(args.displaySurface),
+        mSize(args.displayWidth, args.displayHeight),
+        mMaxTextureCacheSize(args.maxTextureCacheSize) {
+    LOG_ALWAYS_FATAL_IF(!mNativeWindow);
+}
+void RenderSurface::initialize() {
+    ANativeWindow* const window = mNativeWindow.get();
+    //作为生产者和BufferQueue建立连接，
+    //并设置了format为RGBA_8888，usage为GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE
+    int status = native_window_api_connect(window, NATIVE_WINDOW_API_EGL);
+    status = native_window_set_buffers_format(window, HAL_PIXEL_FORMAT_RGBA_8888);
+    status = native_window_set_usage(window, DEFAULT_USAGE);
+}
+constexpr auto DEFAULT_USAGE = GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE;
+```
+
+创建DisplayDevice时会去创建RenderSurface，RenderSurface在初始化时会作为生产者与BufferQueue建立连接。这里先有个印象，FramebufferSurface是作为消费者消费SF GPU合成后的图形数据，而RenderSurface作为生产者生产图形数据。
+
+再看注释5-3处执行initScheduler
 
 ```c++
 void SurfaceFlinger::initScheduler(const sp<DisplayDevice>& display) {
@@ -3447,7 +3544,7 @@ void Output::finishFrame(const CompositionRefreshArgs& refreshArgs, GpuCompositi
         optReadyFence = composeSurfaces(Region::INVALID_REGION, refreshArgs, buffer, bufferFence);
     }
 
-    //BufferQueue的queueBuffer操作
+    //BufferQueue的queueBuffer操作，把GPU合成之后的buffer入队
     mRenderSurface->queueBuffer(std::move(*optReadyFence));
 }
 
@@ -3500,6 +3597,7 @@ void RenderSurface::queueBuffer(base::unique_fd readyFence) {
         //...
         mTexture = nullptr;
     }
+    //消费buffer
     //对于非虚拟屏是FramebufferSurface，其包装消费者、继承DisplaySurface；
     //对于虚拟屏是VirtualDisplaySurface
     status_t result = mDisplaySurface->advanceFrame();
@@ -3510,6 +3608,7 @@ status_t FramebufferSurface::advanceFrame() {
     sp<GraphicBuffer> buf;
     sp<Fence> acquireFence(Fence::NO_FENCE);
     Dataspace dataspace = Dataspace::UNKNOWN;
+    //消费这块buffer
     status_t result = nextBuffer(slot, buf, acquireFence, dataspace);
     return result;
 }
@@ -3525,7 +3624,9 @@ status_t FramebufferSurface::nextBuffer(uint32_t& outSlot,
 }
 ```
 
-注释84处composeSurfaces是GPU合成的核心，后面详细讲。先继续看注释80处postFramebuffer告诉HWC做最后的合成并显示
+注释84处composeSurfaces是GPU合成的核心，后面详细讲。然后在queueBuffer里把gpu合成后的buffer和fence传给HWC，其实这里并没真正传递给HWC，只是写到命令缓冲区，需要在postFramebuffer中执行到present时才执行传递
+
+先继续看注释80处postFramebuffer告诉HWC做最后的合成并显示
 
 ```cpp
 //Output.h
@@ -3597,6 +3698,20 @@ compositionengine::Output::FrameFences Display::presentAndGetFrameFences() {
     }
     hwc.clearReleaseFences(*halDisplayIdOpt);
     return fences;
+}
+//HWComposer.cpp
+status_t HWComposer::presentAndGetReleaseFences(
+    HalDisplayId displayId, std::chrono::steady_clock::time_point earliestPresentTime,
+    const std::shared_ptr<FenceTime>& previousPresentFence) {
+    //...
+    //执行present，返回present fence
+    //这里真正把GPU合成的buffer和fence传给HWC
+    auto error = hwcDisplay->present(&displayData.lastPresentFence);
+    std::unordered_map<HWC2::Layer*, sp<Fence>> releaseFences;
+    //从hwc里面获得release fence
+    error = hwcDisplay->getReleaseFences(&releaseFences);
+    displayData.releaseFences = std::move(releaseFences);
+    return NO_ERROR;
 }
 ```
 
