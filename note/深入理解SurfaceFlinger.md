@@ -145,7 +145,7 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory, SkipInitializationTag)
 }
 ```
 
-构造函数里的其他参数初始化不再细看，主要看下mCompositionEngine（Composition译为作品，构图，组合等）的初始化。
+构造函数里的其他参数初始化不再细看，主要看下mCompositionEngine（合成引擎）的初始化。
 
 > frameworks/native/services/surfaceflinger/SurfaceFlingerDefaultFactory.cpp 
 
@@ -153,7 +153,7 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory, SkipInitializationTag)
 std::unique_ptr<compositionengine::CompositionEngine> DefaultFactory::createCompositionEngine() {
     return compositionengine::impl::createCompositionEngine();
 }
-//创建HWComposer，后面init方法有用到
+//创建HWComposer，后面init方法有用到，这里先粘贴过来
 std::unique_ptr<HWComposer> DefaultFactory::createHWComposer(const std::string& serviceName) {
     return std::make_unique<android::impl::HWComposer>(serviceName);
 }
@@ -166,12 +166,12 @@ std::unique_ptr<compositionengine::CompositionEngine> createCompositionEngine() 
 
 > make_unique是C++14引入的一个函数模板,用于创建并返回一个指向动态分配对象的unique_ptr智能指针。它是为了简化代码,避免手动使用new和delete,以及确保资源的正确释放而设计的。其实就是创建并返回了个指定对象的智能指针。
 
-继续看注释1处`flinger->init()`执行了SurfaceFlinger的init方法
+这里直接在surfaceflinger的构造函数中创建了合成引擎。继续看注释1处`flinger->init()`执行了SurfaceFlinger的init方法
 
 ```cpp
 void SurfaceFlinger::init() {
     //...
-    //基于build模式创建RenderEngine对象，再把其设置到mCompositionEngine里
+    //基于build模式创建RenderEngine（渲染引擎），再把其设置到mCompositionEngine（合成引擎）里
     auto builder = renderengine::RenderEngineCreationArgs::Builder()
         .setPixelFormat(static_cast<int32_t>(defaultCompositionPixelFormat))
         .setImageCacheSize(maxFrameBufferAcquiredBuffers)
@@ -186,8 +186,9 @@ void SurfaceFlinger::init() {
     mCompositionEngine->setRenderEngine(renderengine::RenderEngine::create(builder.build()));
     
     mCompositionEngine->setTimeStats(mTimeStats);
-	//创建HWComposer对象，再把其设置到mCompositionEngine里
+	//创建HWComposer（硬件合成）对象，再把其设置到mCompositionEngine里
     mCompositionEngine->setHwComposer(getFactory().createHWComposer(mHwcServiceName));
+    //设置硬件合成的监听为自己
     mCompositionEngine->getHwComposer().setCallback(*this);
     
     //4 处理热插拔和显示更改的事件
@@ -205,7 +206,7 @@ void SurfaceFlinger::init() {
 }
 ```
 
-里面会先对CompositionEngine设置RenderEngine和HwComposer（通过HAL层的HWComposer硬件模块或者软件模拟产生Vsync信号），再看注释4处`processDisplayHotplugEventsLocked`方法 **创建与初始化FramebufferSurface和initScheduler流程**
+init时会先对CompositionEngine设置RenderEngine和HwComposer（通过HAL层的HWComposer硬件模块或者软件模拟产生Vsync信号），再看注释4处`processDisplayHotplugEventsLocked`方法 **创建与初始化FramebufferSurface（消费者）和RenderSurface（生产者）流程**
 
 ```c++
 void SurfaceFlinger::processDisplayHotplugEventsLocked() {
@@ -336,22 +337,24 @@ RenderSurface::RenderSurface(const CompositionEngine& compositionEngine, Display
 }
 void RenderSurface::initialize() {
     ANativeWindow* const window = mNativeWindow.get();
-    //作为生产者和BufferQueue建立连接，
-    //并设置了format为RGBA_8888，usage为GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE
+    //作为生产者和BufferQueue建立连接
     int status = native_window_api_connect(window, NATIVE_WINDOW_API_EGL);
+    //并设置了format为RGBA_8888，usage为GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE
     status = native_window_set_buffers_format(window, HAL_PIXEL_FORMAT_RGBA_8888);
     status = native_window_set_usage(window, DEFAULT_USAGE);
 }
 constexpr auto DEFAULT_USAGE = GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE;
 ```
 
-创建DisplayDevice时会去创建RenderSurface，RenderSurface在初始化时会作为生产者与BufferQueue建立连接。这里先有个印象，FramebufferSurface是作为消费者消费SF GPU合成后的图形数据，而RenderSurface作为生产者生产图形数据。
+创建DisplayDevice时会去创建RenderSurface，RenderSurface在初始化时会作为生产者与BufferQueue建立连接，另外RenderSurface还持有了消费者FramebufferSurface的引用DisplaySurface。这里先有个印象，FramebufferSurface是作为消费者消费SF GPU合成后的图形数据，而RenderSurface作为生产者生产图形数据。盗一张别人的图来说明RenderSurface和FramebufferSurface的关系
+
+![RenderSurface和FrameBufferSurface的关系](img/RenderSurface和FrameBufferSurface.png)
 
 再看注释5-3处执行initScheduler
 
 ```c++
 void SurfaceFlinger::initScheduler(const sp<DisplayDevice>& display) {
-    //如果初始化过就直接return
+    //如果初始化过就直接return，所以后面初始化Scheduler只会执行一次
     if (mScheduler) {
         mScheduler->setRefreshRateConfigs(display->holdRefreshRateConfigs());
         return;
@@ -491,7 +494,13 @@ void SurfaceFlinger::createPhaseOffsetExtn() {
   
 ```
 
-最上面注释1处的init过程就看完了，surfaceflinger初始化时会创建两个eventthread线程：app和appsf，分别用来接收vsync后通知app完成绘制和sf来完成合成，两个线程基于不同的偏移量，保证app线程执行完渲染后再由appsf线程完成合成。
+最上面注释1处的init过程就看完了，先做个小结
+
++ surfaceflinger的构造函数中会先创建CompositionEngine
+
++ 在init方法里会先创建RenderEngine和HwComposer，再把其关联到CompositionEngine中。之后创建与初始化FramebufferSurface（消费者）和RenderSurface（生产者）
+
++ 在initScheduler中初始化时会创建两个eventthread线程：app和appsf，分别用来接收vsync后通知app完成绘制和sf来完成合成，两个线程基于不同的偏移量，保证app线程执行完渲染后再由appsf线程完成合成。
 
 注释2处是把surfaceflinger发布到ServiceManager，绑定时会回调surfaceflinger的binderDied方法
 
@@ -511,7 +520,7 @@ void SurfaceFlinger::binderDied(const wp<IBinder>&) {
 }
 ```
 
-如果绑定到ServerManager的surfaceflinger服务挂掉的话，这里会重新执行开机动画。
+如果绑定到ServerManager的surfaceflinger服务挂掉的话，这里会重新执行开机动画，表现出来的就是机器又重启了。
 
 注释3会调用run方法，进入休眠
 
@@ -562,11 +571,11 @@ void MessageQueue::waitMessage() {
 
 可以看到SurfaceFlinger的主线程通过死循环执行waitMessage，而其内部是通过mLooper->pollOnce去获取消息。这块的Looper，MessageQueue和java层的不是同一个对象，此处的Looper和MQ是专门为SurfaceFlinger设计的。  
 
-到这里先总结下，SurfaceFlinger启动过程是从SurfaceFlinger.rc配置执行了main_surfaceflinger.cpp的main方法，这里会先创建SurfaceFlinger对象并执行其init方法，这里会初始化scheduler，在scheduler初始化时会创建两个EventThread线程：app，appsf线程，接收到vsync信号后app线程通知客户端执行绘制流程，然后appsf线程在一段时间后执行合成流程。初始化完之后surfaceflinger会在主线程执行waitMessage等待消息，内部是通过Looper.poolOnce去获取消息。  
+到这里再完整总结下，SurfaceFlinger启动过程是从SurfaceFlinger.rc配置执行了main_surfaceflinger.cpp的main方法，这里会先创建SurfaceFlinger对象并执行其init方法，这里会先创建渲染引擎，硬件合成，再把其关联到合成引擎中，然后创建FrameBufferSurface（消费者）和RenderSurface（生产者） ，初始化scheduler，此时会创建两个EventThread线程：app，appsf线程，接收到vsync信号后app线程通知客户端执行绘制流程，appsf线程在一段时间后执行合成流程。初始化完之后surfaceflinger会发布到ServiceManager中，然后执行run在主线程执行waitMessage等待消息，内部是通过Looper.poolOnce去获取消息。  
+
+SurfaceFlinger准备好后，就等待其他进程的召唤了。
 
 #### SurfaceFlinger工作流程
-
-> 启动过程有几个比较重要的对象没有细看，比如，DispSyncSource，HWComposer，在SurfaceFlinger工作流程中将会再关注到这几个对象。
 
 我们分析下从应用启动流程到屏幕显示出画面的过程。
 
