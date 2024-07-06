@@ -579,7 +579,7 @@ SurfaceFlinger准备好后，就等待其他进程的召唤了。
 
 我们分析下从应用启动流程到屏幕显示出画面的过程。
 
-##### 1 与SurfaceFlinger创建连接
+##### SurfaceSession的创建
 
 先复习下，在[深入理解WMS](https://github.com/beyond667/study/blob/master/note/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3WMS.md)一节的Session中可知，ActivityThread.handleResumeActivity -> WindowManagerImpl.addView -> WindowManagerGlobal.addView -> new ViewRootImpl ->WindowManagerGlobal.getWindowSession()，应用初始化ViewRootImpl时会去获取Session，而Session在应用中是单例存在的，即一个应用只有一个Session。
 
@@ -744,11 +744,11 @@ class BnSurfaceComposerClient : public SafeBnInterface<ISurfaceComposerClient> {
 
 SurfaceFlinger直接返回了Client的代理对象，并保存在注释14的mClient中。后面客户端通过SurfaceComposerClient创建surface是通过的Client的代理对象mClient来做的，实际上调用的还是在SurfaceFlinger中new的Client对象。这样，客户端就完成了与SurfaceFlinger的联系。  
 
-总结下，应用在启动中初始化ViewRootImpl时会创建跟WMS的连接Session，之后在ViewRootImpl.setView中会通过session调用到WMS.addWindow，这里会创建WindowState，并执行其attach，首次会通过JNI创建SurfaceSession，其实是返回了SurfaceComposerClient对象的地址，此对象里持有的mClient对象是通过surfaceflinger创建的Client对象。
+总结下，应用在启动中初始化ViewRootImpl时会创建跟WMS的连接Session，之后在ViewRootImpl.setView中会通过session调用到WMS.addWindow，这里会创建WindowState，并执行其attach，首次会通过JNI创建SurfaceSession，其实是返回了SurfaceComposerClient对象的地址，此对象里持有的mClient对象是通过surfaceflinger创建的Client对象，也就是说WMS所在是system_server进程持有了SF创建的Client代理对象。
 
-##### 2 Surface创建流程
+##### SurfaceControl创建流程
 
-下面分析View绘制到Surface创建过程。  
+下面分析View绘制到Surface的创建过程。Surface创建需要先了解SurfaceControl的创建。    
 
 我们知道，view绘制时会调用ViewRootImpl.requestLayout 
 
@@ -794,9 +794,11 @@ void doTraversal() {
 }
 
 private void performTraversals() {
+    //...
     //先准备窗口，再开始具体绘制流程
     relayoutResult = relayoutWindow(params, viewVisibility, insetsPending);
 	//具体绘制流程，performMeasure，performLayout，performDraw
+    //...
 }
 ```
 
@@ -1051,8 +1053,7 @@ status_t SurfaceComposerClient::createSurfaceChecked(const String8& name, uint32
         uint32_t transformHint = 0;
         int32_t id = -1;
         //26 调用服务端SurfaceFlinger进程Client的createSurface
-        err = mClient->createSurface(name, w, h, format, flags, parentHandle, std::move(metadata),
-                                     &handle, &gbp, &id, &transformHint);
+        err = mClient->createSurface(name, w, h, format, flags, parentHandle, std::move(metadata),&handle, &gbp, &id, &transformHint);
 
         if (outTransformHint) {
             *outTransformHint = transformHint;
@@ -1060,8 +1061,7 @@ status_t SurfaceComposerClient::createSurfaceChecked(const String8& name, uint32
 
         if (err == NO_ERROR) {
             //27 基于注释26返回的handle，system_server进程中创建个SurfaceControl
-            *outSurface =
-                new SurfaceControl(this, handle, gbp, id, w, h, format, transformHint, flags);
+            *outSurface = new SurfaceControl(this, handle, gbp, id, w, h, format, transformHint, flags);
         }
     }
     return err;
@@ -1087,7 +1087,7 @@ status_t Client::createSurface(const String8& name, uint32_t /* w */, uint32_t /
 }
 ```
 
-Client.createSurface调用到了SurfaceFlinger.createLayer，从方法名称上也可以理解，`对SurfaceFlinger来说，创建Surface也就是创建layer`
+Client.createSurface调用到了SurfaceFlinger.createLayer，从方法名称上也可以理解为，`对SurfaceFlinger来说，创建Surface也就是创建layer`
 
 > frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
 
@@ -1213,7 +1213,7 @@ class Handle : public BBinder, public LayerCleaner {
 };
 ```
 
-Handle其实就是个binder对象，相当于SurfaceFlinger把此对象的代理对象返回给SurfaceComposerClient的进程，即wms所在的进程-system_server进程，再在注释27处基于此binder对象来创建SurfaceControl对象，再把SurfaceControl对象的内存地址传给wms进程的java端，后面WMS就可以基于此地址来操作SurfaceControl，即变相操作SurfaceFlinger的layer完成合成等操作。
+Handle其实就是个binder对象，相当于SurfaceFlinger把此对象的代理对象返回给SurfaceComposerClient的进程，即wms所在的进程-system_server进程，再在注释27处基于此binder对象来创建SurfaceControl对象，再把SurfaceControl对象的内存地址传给wms进程的java端，再返回给客户端，客户端就可以基于此地址来操作SurfaceControl，即变相操作SurfaceFlinger的layer完成合成等操作。
 
 到这里完成了layer和handle的创建以及在handle里绑定了layer，但是Client和SurfaceFlinger并不清楚其关系，所以在注释30处SurfaceFlinger::createLayer调用addClientLayer来完成client和SurfaceFlinger对两者的记录。
 
@@ -1299,7 +1299,7 @@ sp<IBinder>                 mHandle;
 sp<IGraphicBufferProducer>  mGraphicBufferProducer;
 ```
 
-handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址返回给java层，其存在WindowSurfaceController的mSurfaceControl，再把其数据拷贝给客户端传过来的SurfaceControl中，相当于客户端的ViewRootImpl和服务端的WindowSurfaceController持有的同一个由JNI层创建的SurfaceControl对象地址，并且都持有了SF创建的layer的代理地址即handle。
+handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址返回给java层，其存在WindowSurfaceController的mSurfaceControl，再把其数据拷贝给客户端传过来的SurfaceControl中，相当于客户端的ViewRootImpl和服务端的WindowSurfaceController持有的同一个由JNI层创建的SurfaceControl对象地址，此SurfaceControl对象持有了SF创建的layer的代理地址即handle。
 
 到这里创建Layer的过程就结束了。  
 
@@ -1309,9 +1309,9 @@ handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址�
 + WMS进程relayoutWindow里会先拿之前创建的WindowState判断是否要重新布局，需要的话就创建个WindowSurfaceController对象，在其构造函数中会基于构建者模式创建SurfaceControl，SurfaceControl的构造函数会通过JNI去创建SurfaceControl。如果JNI创建成功，就会把SurfaceControl数据拷贝到客户端传进来的对象里。
 + 再看JNI创建SurfaceControl的过程，此时还在wms进程，会先通过之前与SF创建连接时拿到的SurfaceComposerClient调用SF进程Client服务端的createSurfaceChecked方法，其会调用SF的createLayer，主要先根据不同的surface类型创建不同的layer，大部分情况下都是创建BufferStateLayer，然后再通过layer.getHandle获取一个Binder对象，此方法只在创建layer时调用一次，再次调用会返回空。此Handle主要是存到给WMS进程返回的SurfaceControl中，以供WMS通过Handle来操作具体的layer
 
-##### Surface的初始化-创建BLASTBufferQueue（BBQ）
+##### Surface的创建
 
-上一小节中，客户端和WMS内部的SurfaceControl都已关联了jni创建的SurfaceControl的地址，还有SF创建的layer代理对象handle的地址。我们继续看ViewRootImpl.relayoutWindow后面的流程注释16处 
+上一小节创建SurfaceControl过程中，客户端和WMS内部的SurfaceControl都已关联了jni创建的SurfaceControl的地址，还有SF创建的layer代理对象handle的地址。我们继续看ViewRootImpl.relayoutWindow后面的流程注释16处 
 
 ```java
 //ViewRootImpl.relayoutWindow
@@ -1351,7 +1351,7 @@ void updateBlastSurfaceIfNeeded() {
 
 ```
 
-注释36会先创建BLASTBufferQueue，再在注释37处通过执行其createSurface来创建Surface。我们先看BLASTBufferQueue的构造函数
+注释36会先创建BLASTBufferQueue（BBQ），再在注释37处通过执行其createSurface来创建Surface。我们先看BLASTBufferQueue的构造函数
 
 > frameworks/base/graphics/java/android/graphics/BLASTBufferQueue.java
 
@@ -1484,9 +1484,9 @@ class ConsumerBase : public virtual RefBase,protected ConsumerListener{}
             
 //ConsumerBase.cpp
 ConsumerBase::ConsumerBase(const sp<IGraphicBufferConsumer>& bufferQueue, bool controlledByApp) :
-        mAbandoned(false),
-        mConsumer(bufferQueue),
-        mPrevFinalReleaseFence(Fence::NO_FENCE) {
+mAbandoned(false),
+mConsumer(bufferQueue),
+mPrevFinalReleaseFence(Fence::NO_FENCE) {
     mName = String8::format("unnamed-%d-%d", getpid(), createProcessUniqueId());
 
     wp<ConsumerListener> listener = static_cast<ConsumerListener*>(this);
@@ -1494,7 +1494,7 @@ ConsumerBase::ConsumerBase(const sp<IGraphicBufferConsumer>& bufferQueue, bool c
 
     //把mConsumer关联到BufferItemConsumer
     status_t err = mConsumer->consumerConnect(proxy, controlledByApp);
-            mConsumer->setConsumerName(mName);
+    mConsumer->setConsumerName(mName);
 }
 
 //BufferQueueConsumer.h
@@ -1513,9 +1513,9 @@ status_t BufferQueueConsumer::connect(
 }
 ```
 
-在注释41处把BufferQueueConsumer里的mCore.mConsumerListener也记录BufferItemConsumer，mCore即创建BufferQueueConsumer时传进来的BufferQueueCore，这样就完成了BLASTBufferItemConsumer到BufferQueue的连接。这个过程其实就是准备了BBQBufferQueueProducer和BufferQueueConsumer（被包装到BLASTBufferItemConsumer里）
+在注释41处把BufferQueueConsumer里的mCore.mConsumerListener也记录BufferItemConsumer，mCore即创建BufferQueueConsumer时传进来的BufferQueueCore，这样就完成了BLASTBufferItemConsumer到BufferQueue的连接。这个过程其实就是准备了BBQBufferQueueProducer和BufferQueueConsumer（被包装到BLASTBufferItemConsumer里）  
 
-##### Surface的初始化-客户端创建Surface
+小结：客户端进程创建BBQ还是通过JNI创建，先创建BufferQueueCore，BBQBufferQueueProducer（生产者）和BufferQueueConsumer（消费者），然后在把SurfaceControl关联进BLASTBufferQueue   
 
 我们继续看注释37 执行BLASTBufferQueue的createSurface来创建Surface的过程
 
@@ -1602,11 +1602,11 @@ template <typename NATIVE_TYPE, typename TYPE, typename REF,
 class ANativeObjectBase : public NATIVE_TYPE, public REF{}
 ```
 
-可以看到Surface本质就是个ANativeWindow。根据其构造函数传的IGraphicBufferProducer和BufferQueue可以猜测其主要是通过图形缓冲区生产者（IGraphicBufferProducer）往BufferQueue里先获取buffer，再把buffer返回给BufferQueue，以供消费者消费，这里的生产者是客户端，当前的消费者是BLASTBufferQueue里包装了IGraphicBufferConsumer的BLASTBufferItemConsumer，其最终的消费者还是SF。到这里，客户端已经创建好了BBQSurface，我们继续看绘制流程。
+可以看到Surface本质就是个ANativeWindow。根据其构造函数传的IGraphicBufferProducer和BufferQueue可以猜测其主要是通过图形缓冲区生产者（IGraphicBufferProducer）先从BufferQueue里获取容器，再把graphicBuffer放到容器后返回给BufferQueue，以供消费者消费，这里的生产者是客户端，当前的消费者是BLASTBufferQueue里包装了IGraphicBufferConsumer的BLASTBufferItemConsumer，其最终的消费者还是SF。到这里，客户端已经创建好了BBQSurface，我们继续看绘制流程。
 
 ##### 绘制流程
 
-在ViewRootImpl执行完relayoutWindow后，此时本地已经获取到了BBQSurface，但是此时还没从BufferQueue里拿Buffer，下面就分析下客户端作为生产者的流程。
+在ViewRootImpl执行完relayoutWindow后，此时本地已经获取到了BBQSurface，但是此时还没从BufferQueue里传Buffer数据，下面就分析下客户端作为生产者的流程。
 
 ```java
 private void performTraversals() {
@@ -1681,12 +1681,12 @@ public Canvas lockCanvas(Rect inOutDirty)
 
 //Canvas.java
 public class Canvas extends BaseCanvas {
-    //此成员变量在父类BaseCanvas里定义
+    //此成员变量在父类BaseCanvas里定义，保存JNI层创建的SKCanvas的地址
     protected long mNativeCanvasWrapper;
     public Canvas() {
         if (!isHardwareAccelerated()) {
             // 0 means no native bitmap
-            //46 JNI层创建native层的canvas并返回其内存地址
+            //46 JNI层创建native层的canvas并返回其内存地址保存到mNativeCanvasWrapper
             mNativeCanvasWrapper = nInitRaster(0);
             mFinalizer = NoImagePreloadHolder.sRegistry.registerNativeAllocation(
                 this, mNativeCanvasWrapper);
@@ -1697,7 +1697,7 @@ public class Canvas extends BaseCanvas {
 }
 ```
 
-在注释45处native层锁Canvas时传了Surface类的成员变量即直接new的CompatibleCanvas，CompatibleCanvas继承于Canvas，Canvas的构造函数中会通过注释46在jni层创建native层的Canvas并返回其地址，我们先看注释46的nInitRaster
+在注释45处native层锁Canvas时传了Surface类的成员变量即直接new的CompatibleCanvas，CompatibleCanvas继承于Canvas，Canvas的构造函数中会通过注释46在jni层创建native层的Canvas并返回其地址，保存到canvas的成员变量mNativeCanvasWrapper里，我们先看注释46的nInitRaster
 
 > frameworks/base/libs/hwui/jni/android_graphics_Canvas.cpp
 
@@ -1729,7 +1729,7 @@ Canvas* Canvas::create_canvas(const SkBitmap& bitmap) {
 ```cpp
 static jlong nativeLockCanvas(JNIEnv* env, jclass clazz,
                               jlong nativeObject, jobject canvasObj, jobject dirtyRectObj) {
-    // 获取对应native层的SUrface对象
+    // 获取对应native层的Surface对象
     sp<Surface> surface(reinterpret_cast<Surface *>(nativeObject));
     //...获取绘制区域的左上右下
     Rect dirtyRect(Rect::EMPTY_RECT);
@@ -1746,7 +1746,7 @@ static jlong nativeLockCanvas(JNIEnv* env, jclass clazz,
     // 47 surface调用lock函数锁定一块buffer
     status_t err = surface->lock(&buffer, dirtyRectPtr);
     //...
-    //48 通过Java层的canvas对象初始化一个native层的canvas对象
+    //48 通过Java层的canvas对象初始化一个native层的canvas对象，即SKCanvas
     graphics::Canvas canvas(env, canvasObj);
     //49 设置buffer，然后canvas把buffer转换为SKBitmap
     canvas.setBuffer(&buffer, static_cast<int32_t>(surface->getBuffersDataSpace()));
@@ -1771,8 +1771,10 @@ typedef struct ANativeWindow_Buffer {
 nativeLockCanvas主要分了三步：
 
 + 注释47 申请并锁定一块内存
-+ 注释48 获取native层的canvas对象
-+ 注释49 把buffer设置进canvas
++ 注释48 获取native层的canvas对象，即SKCanvas
++ 注释49 把buffer设置进canvas，其中SKCanvas会把buffer转换为SKBitmap，SKBitmap可以被canvas绘制
+
+其实就是先申请一块buffer，再通过java层的canvas获取个native层的SKCanvas，再把buffer设置进SKCanvas，SKCanvas里会把buffer转换成SKBitmap，SKBitmap就可以被canvas直接绘制。
 
 先看注释47 surface->lock
 
@@ -1798,8 +1800,8 @@ status_t Surface::lock(ANativeWindow_Buffer* outBuffer, ARect* inOutDirtyBounds)
         // figure out if we can copy the frontbuffer back
         // mPostedBuffer作为正在显示的一块图像区域
         const sp<GraphicBuffer>& frontBuffer(mPostedBuffer);
-        //其实这里就涉及到SUrface的双缓冲机制 mPostedBuffer/mLockedBuffer两块buffer
-        // 这里要判断是否可以复制（比较一下backBuffer与frontBuffer）
+        //其实这里就涉及到Surface的双缓冲机制 mPostedBuffer/mLockedBuffer两块buffer
+        //这里要判断是否可以复制（比较一下backBuffer与frontBuffer）
         const bool canCopyBack = (frontBuffer != nullptr &&
                                   backBuffer->width  == frontBuffer->width &&
                                   backBuffer->height == frontBuffer->height &&
@@ -1813,7 +1815,7 @@ status_t Surface::lock(ANativeWindow_Buffer* outBuffer, ARect* inOutDirtyBounds)
                 copyBlt(backBuffer, frontBuffer, copyback, &fenceFd);
             }
         } else {
-            // 设置脏区域的边界
+            //设置脏区域的边界
             newDirtyRegion.set(bounds);
             //不能复制则清理一下原先的数据
             mDirtyRegion.clear();
@@ -1832,8 +1834,9 @@ status_t Surface::lock(ANativeWindow_Buffer* outBuffer, ARect* inOutDirtyBounds)
         if (res != 0) {
             err = INVALID_OPERATION;
         } else {
-            //申请的这块backBuffer保存为mLockedBuffer
+            //backBuffer保存为mLockedBuffer
             mLockedBuffer = backBuffer;
+            //backBuffer里的参数赋值给传进来的buffer
             outBuffer->width  = backBuffer->width;
             outBuffer->height = backBuffer->height;
             outBuffer->stride = backBuffer->stride;
@@ -1854,9 +1857,9 @@ int Surface::dequeueBuffer(android_native_buffer_t** buffer, int* fenceFd) {
 }
 ```
 
-注释50处先dequeueBuffer从输入缓冲队列中获取一块内存，这里牵涉到Surface的双缓冲机制，即前后缓冲区，正在显示的作为前缓冲区，在后台准备新的数据的为后缓冲区。这里会先拿前缓冲区与后缓冲区的参数（宽高，format）判断是否可以直接复制，然后锁定后缓冲区。
+注释50处先dequeueBuffer从输入缓冲队列中获取一块内存ANativeWindowBuffer，然后把其作为backBuffer（后缓冲区），这里牵涉到Surface的双缓冲机制，即前后缓冲区，正在显示的作为前缓冲区，在后台准备新的数据的为后缓冲区。这里会先拿前缓冲区与后缓冲区的参数（宽高，format）判断是否可以直接复制，然后锁定后缓冲区。
 
-再看注释48获取native层的Canvas
+再看注释48获取native层的Canvas： graphics::Canvas canvas(env, canvasObj);
 
 ```c++
 //frameworks/base/libs/hwui/apex/include/android/graphics/canvas.h
@@ -1888,6 +1891,7 @@ android::Canvas* GraphicsJNI::getNativeCanvas(JNIEnv* env, jobject canvas) {
     return reinterpret_cast<android::Canvas*>(canvasHandle);
 }
 int register_android_graphics_Graphics(JNIEnv* env){
+    //gCanvas_nativeInstanceID即java层Canvas的成员变量mNativeCanvasWrapper
     gCanvas_nativeInstanceID = GetFieldIDOrDie(env, gCanvas_class, "mNativeCanvasWrapper", "J");
 }
 ```
@@ -1909,14 +1913,14 @@ bool ACanvas_setBuffer(ACanvas* canvas, const ANativeWindow_Buffer* buffer,
     SkBitmap bitmap;
     //52 把buffer转换为SKBitmap
     bool isValidBuffer = (buffer == nullptr) ? false : convert(buffer, dataspace, &bitmap);
-    // 然后把SKBitmap设置进SkiaCanvas中（SKBitmap可以被canvas绘制）
+    //然后把SKBitmap设置进SkiaCanvas中（SKBitmap可以被canvas绘制）
     TypeCast::toCanvas(canvas)->setBitmap(bitmap);
     return isValidBuffer;
 }
 
 //frameworks/base/libs/hwui/SkiaCanvas.cpp 
 void SkiaCanvas::setBitmap(const SkBitmap& bitmap) {
-    // 根据传入的bitmap创建一个SkCanvas，并更新
+    //根据传入的bitmap创建一个SkCanvas，并更新
     mCanvasOwned.reset(new SkCanvas(bitmap));
     mCanvas = mCanvasOwned.get();
 
@@ -1927,7 +1931,9 @@ void SkiaCanvas::setBitmap(const SkBitmap& bitmap) {
 
 注释52把获取的buffer转换为一个SkBitmap,此时bitmap中有有效信息，然后把此bitmap设置进SkiaCanvas并替换原来的Bitmap（SKBitmap可以被canvas绘制），接下来canvas就在这个bitmap上进行绘制。
 
-注释43处lockCanvas获取有效的Canvas结束后，下面mView.draw(canvas)过程不再细看，都会调用view的onDraw传入此canvas完成绘制，其实都是通过JNI层的SkiaCanvas绘制到SkBitmap上，这些都是通过skia图像绘制引擎具体实现，这里不再讨论。我们继续看绘制完之后注释44处释放并post此canvas
+> 可以把Canvas理解成画布，把画布想象成一块内存空间，也就是一个Bitmap，Canvas的API提供了一整套在这个Bitmap上绘图的方法。
+
+注释43处lockCanvas获取有效的Canvas结束后，下面mView.draw(canvas)过程不再细看，都会调用view的onDraw传入此canvas完成绘制，其实都是通过JNI层的SkiaCanvas绘制到SkBitmap上，这些都是通过skia图像绘制引擎具体实现，这里不再讨论绘制具体内容的流程。我们继续看绘制完之后注释44处释放并post此canvas
 
 ```java
 public void unlockCanvasAndPost(Canvas canvas) {
@@ -1986,12 +1992,12 @@ status_t Surface::unlockAndPost()
     }
 
     int fd = -1;
-    // 解除锁定
+    //解除锁定
     status_t err = mLockedBuffer->unlockAsync(&fd);
     //53 把这块绘制完毕的buffer提交到缓冲队列中，等待显示
     err = queueBuffer(mLockedBuffer.get(), fd);
     //...
-    // 接着这块buffer就变成了前台已发布的buffer了，这个就是双缓冲机制了
+    //接着这块buffer就变成了前台已发布的buffer了，这个就是双缓冲机制了
     mPostedBuffer = mLockedBuffer;
     //置空
     mLockedBuffer = nullptr;
@@ -2001,7 +2007,7 @@ status_t Surface::unlockAndPost()
 
 注释53处Surface在unlockAndPost时调用queueBuffer把绘制完毕的buffer提交到缓冲队列，等待消费者消费后显示。  
 
-做个小结，ViewRootImpl通过Surface的dequeueBuffer从缓冲队列获取一块可用于绘制的buffer，然后把buffer转换成SKBitmap后绑定到canvas中，View使用该canvas进行绘制，实际上就是绘制到SKBitmap中，即保存在buffer中，绘制完毕后，通过surface清除canvas与buffer的绑定关系，并通过queueBuffer把buffer发送到缓冲队列。此后再有消费者，大部分情况下是SurfaceFlinger进行消费，也有例外，比如也可以通过视频编码器进行消费。
+做个小结，ViewRootImpl通过Surface的dequeueBuffer从缓冲队列获取一块可用于绘制的buffer，然后把buffer转换成SKBitmap后绑定到canvas中，View使用该canvas进行绘制，实际上就是绘制到SKBitmap中，即保存在buffer中，绘制完毕后，通过surface清除canvas与buffer的绑定关系，并通过queueBuffer把绘制后的buffer发送到缓冲队列。此后再由消费者，大部分情况下是SurfaceFlinger进行消费，也有例外，比如也可以通过视频编码器进行消费。
 
 ##### 提交事务到SF
 
@@ -2010,6 +2016,8 @@ status_t Surface::unlockAndPost()
 ```c++
 //Surface.cpp
 int Surface::queueBuffer(android_native_buffer_t* buffer, int fenceFd) {
+    //找到buffer在mSlots中的下标
+    int i = getSlotFromBufferLocked(buffer);
     //...
     //调用绑定的GraphicBufferProducer.queueBuffer，即BufferQueueProducer
     status_t err = mGraphicBufferProducer->queueBuffer(i, input, &output);
@@ -2041,7 +2049,7 @@ void BLASTBufferQueue::acquireNextBufferLocked(const std::optional<SurfaceCompos
     bool applyTransaction = true;
     SurfaceComposerClient::Transaction* t = &localTransaction;
     //...
-    //54 调用消费者的acquireBuffer从bufferqueue里取到传进去的空的BufferItem里
+    //54 调用消费者的acquireBuffer从bufferqueue里取的值存到传进去的空的BufferItem里
     BufferItem bufferItem;
     status_t status =mBufferItemConsumer->acquireBuffer(&bufferItem, 0 , false);
     auto buffer = bufferItem.mGraphicBuffer;
