@@ -2147,7 +2147,7 @@ struct ComposerState {
 };
 ```
 
-注释59其实buffer数据是保存在了ComposerState里面的layer_state_t里面的bufferData里。数据已经有了，我们继续看注释58处调用SF.setTransactionState
+注释59其实buffer数据是保存在了ComposerState里面的layer_state_t里面的bufferData里。buffer数据已经有了，我们继续看注释58处调用SF.setTransactionState
 
 ```cpp
 //SurfaceFlinger.cpp
@@ -2298,10 +2298,10 @@ void MessageQueue::Handler::handleMessage(const Message&) {
     mFramePending.store(false);
 
     const nsecs_t frameTime = systemTime();
-     // mQueue  类型android::impl::MessageQueue
-    // android::impl::MessageQueue.mCompositor 类型 ICompositor
-    // SurfaceFlinger 继承 ICompositor
-    // mQueue.mCompositor 其实就是 SurfaceFlinger 
+    //mQueue  类型android::impl::MessageQueue
+    //android::impl::MessageQueue.mCompositor 类型 ICompositor
+    //SurfaceFlinger 继承 ICompositor
+    //mQueue.mCompositor 其实就是 SurfaceFlinger 
     auto& compositor = mQueue.mCompositor;
     
     //61 调用到SF的commit，返回false的话，直接返回，否则执行后面的合成流程composite
@@ -2362,7 +2362,7 @@ bool SurfaceFlinger::commit(nsecs_t frameTime, int64_t vsyncId, nsecs_t expected
 
 commit这块稍微有点复杂
 
-+ 注释62处会判断事务的tag是否是eTransactionFlushNeeded，是的话就走注释63和64，此标记是在注释60处传过来的。另外注意到最开始创建layer时设置的标记为eTransactionNeeded，此时并不会触发注释63把layer添加进mCurrentState.layersSortedByZ，更不会走后面合成流程。
++ 注释62处会判断事务的tag是否是eTransactionFlushNeeded，是的话就走注释63和64，此标记是在注释60处传过来的。另外注意到最开始创建layer时（注释33处）设置的标记为eTransactionNeeded，此时并不会触发注释63把layer添加进mCurrentState.layersSortedByZ，更不会走后面合成流程。
 + 注释63 处理以前创建的layer，核心就是把新创建的layer加入到Z轴排序集合体系 mCurrentState.layersSortedByZ
 + 注释64会flush事务队列，里面会apply事务，处理客户端传过来的数据
 + 注释65根据63和64的返回值来判断是否需要提交事务，提交的核心就是把 mCurrentState 赋值给 mDrawingState，即把客户端传过来的mCurrentState数据，赋值给mDrawingState 用于后面合成流程
@@ -2431,6 +2431,8 @@ struct layer_state_t {
     sp<SurfaceControl> reparentSurfaceControl;
     sp<SurfaceControl> relativeLayerSurfaceControl;
     float shadowRadius;
+    //客户端传过来的buffer
+    std::shared_ptr<BufferData> bufferData = nullptr;
     //...
 }
 //SurfaceFlinger.cpp
@@ -2612,7 +2614,7 @@ void SurfaceFlinger::commitTransactionsLocked(uint32_t transactionFlags) {
     doCommitTransactions();
 }
 void SurfaceFlinger::doCommitTransactions() {
-    // 处理以及被移除的layer集合 mLayersPendingRemoval。释放buffer，从layersSortedByZ移除，加入到mOffscreenLayers
+    //处理被移除的layer集合 mLayersPendingRemoval。释放buffer，从layersSortedByZ移除，加入到mOffscreenLayers
     if (!mLayersPendingRemoval.isEmpty()) {
         for (const auto& l : mLayersPendingRemoval) {
             if (l->isRemovedFromCurrentState()) {
@@ -2845,9 +2847,9 @@ void SurfaceFlinger::computeLayerBounds() {
 }
 ```
 
-在有新layer增加时会调用每个layer的computeBounds，计算每个layer的边界；再根据SurfaceFlinger::latchBuffers时拿到的mLayersPendingRefresh这个集合计算脏区域。  
+在有新layer增加时会调用每个layer的computeBounds，计算每个layer的边界；再根据SurfaceFlinger::latchBuffers时拿到的mLayersPendingRefresh这个集合计算脏区域。    
 
-到这里commit流程就结束了，需要走合成流程时返回true，否则返回false。
+小结：commit流程会先把新创建的layer加入到Z轴排序集合体系 mCurrentState.layersSortedByZ里，然后执行每个layer执行latchBuffer方法来确定是否需要重新计算显示区域，再去计算边界和脏区域，如果需要合成就返回true，否则返回false。
 
 ##### SF的composite流程
 
@@ -2900,7 +2902,7 @@ void SurfaceFlinger::composite(nsecs_t frameTime, int64_t vsyncId)
 }
 ```
 
-SurfaceFlinger::composite这里合成流程较清晰。先在注释72处构建需要合成的参数，上面注释很清楚，主要把需要合成的display，layer，有帧数据的layer等添加到此参数里，然后在注释73处通过合成引擎去真正完成合成工作，最后在注释74处postComposition做些收尾工作。我们主要看注释73处mCompositionEngine->present真正合成的流程，此过程较复杂，是SF合成的核心。
+SurfaceFlinger::composite这里合成流程较清晰。先在注释72处构建需要合成的参数，主要把需要合成的display，layer，有帧数据的layer等添加到此参数里，然后在注释73处通过合成引擎去真正完成合成工作，最后在注释74处postComposition做些收尾工作。我们主要看注释73处mCompositionEngine->present真正合成的流程，此过程较复杂，是SF合成的核心。
 
 ```cpp
 void CompositionEngine::present(CompositionRefreshArgs& args) {
