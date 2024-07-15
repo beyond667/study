@@ -3909,3 +3909,385 @@ status_t BufferQueueConsumer::releaseBuffer(int slot, uint64_t frameNumber,
 其实就是调用了消费者的releaseBuffer，如果有阻塞在dequeuebuffer的线程，此时会被唤醒。  
 
 小结：SurfaceFlinger的合成会先构建合成需要的参数refreshArgs，把SF里保存的layer等信息传进去，再调用合成引擎的present方法。此方法会遍历所有的显示设备output，调用其prepare和present方法，其中prepare方法会从顶层到底层遍历所有的Layer，把不需要参与合成的layer放到mReleasedLayers中。present方法会调用prepareFrame通过HWC服务去确认是用客户端合成还是硬件合成，如果由硬件合成，合成流程直接结束，否则会在finishFrame里处理客户端合成，即GPU合成，这里会调用composeSurfaces去真正处理GPU合成，然后会postFramebuffer告诉HWC做最后的合成并显示，这里会调用hwc的presentAndGetReleaseFences先展示已经要显示的帧（FrameFences.presentFence），然后把当前的帧赋值到此字段，等待下一个vsync信号后再展示。合成完后会在postComposition通过binder调用到客户端的onTransactionCompleted方法，这里会调用BBQ的releaseBuffer方法，其会调用消费者的releaseBuffer，释放完后把slot放到空闲队列，如果有线程阻塞在dequeuebuffer的，此时会被唤醒。
+
+##### composeSurfaces
+
+继续上面注释84处composeSurfaces，看下GPU具体是怎么合成的
+
+```cpp
+std::optional<base::unique_fd> Output::composeSurfaces(
+    const Region& debugRegion, const compositionengine::CompositionRefreshArgs& refreshArgs,
+    std::shared_ptr<renderengine::ExternalTexture> tex, base::unique_fd& fd) {
+
+    //设置clientCompositionDisplay，这个是display相关参数
+    renderengine::DisplaySettings clientCompositionDisplay;
+    clientCompositionDisplay.physicalDisplay = outputState.framebufferSpace.getContent();
+    clientCompositionDisplay.clip = outputState.layerStackSpace.getContent();
+    clientCompositionDisplay.orientation =
+        ui::Transform::toRotationFlags(outputState.displaySpace.getOrientation());
+    //...省略设置clientCompositionDisplay其他属性
+
+    std::vector<LayerFE*> clientCompositionLayersFE;
+    //设置clientCompositionLayers，这个是layer的相关参数
+    std::vector<LayerFE::LayerSettings> clientCompositionLayers =
+        generateClientCompositionRequests(supportsProtectedContent,
+                                          clientCompositionDisplay.outputDataspace,
+                                          clientCompositionLayersFE);
+    
+    OutputCompositionState& outputCompositionState = editState();
+    //如果cache里有相同的Buffer，则不需要重复draw一次
+    if (mClientCompositionRequestCache && mLayerRequestingBackgroundBlur != nullptr) {
+        if (mClientCompositionRequestCache->exists(tex->getBuffer()->getId(),
+                                                   clientCompositionDisplay,
+                                                   clientCompositionLayers)) {
+            outputCompositionState.reusedClientComposition = true;
+            setExpensiveRenderingExpected(false);
+            return base::unique_fd(std::move(fd));
+        }
+        mClientCompositionRequestCache->add(tex->getBuffer()->getId(), clientCompositionDisplay,
+                                            clientCompositionLayers);
+    }
+    
+    //针对有模糊layer和有复杂颜色空间转换的场景，给GPU进行提频
+    const bool expensiveBlurs =
+        refreshArgs.blursAreExpensive && mLayerRequestingBackgroundBlur != nullptr;
+    const bool expensiveRenderingExpected = expensiveBlurs ||
+        std::any_of(clientCompositionLayers.begin(), clientCompositionLayers.end(),
+                    [outputDataspace =
+                     clientCompositionDisplay.outputDataspace](const auto& layer) {
+                        return layer.sourceDataspace != outputDataspace;
+                    });
+    if (expensiveRenderingExpected) {
+        setExpensiveRenderingExpected(true);
+    }
+    
+    //将clientCompositionLayers里面的内容插入到clientCompositionLayerPointers，实质内容相同
+    std::vector<renderengine::LayerSettings> clientRenderEngineLayers;
+    clientRenderEngineLayers.reserve(clientCompositionLayers.size());
+    std::transform(clientCompositionLayers.begin(), clientCompositionLayers.end(),
+                   std::back_inserter(clientRenderEngineLayers),
+                   [](LayerFE::LayerSettings& settings) -> renderengine::LayerSettings {
+                       return settings;
+                   });
+    //85 GPU合成，主要逻辑在drawLayers里面
+    auto fenceResult =
+        toFenceResult(renderEngine.drawLayers(clientCompositionDisplay, clientRenderEngineLayers,tex, 
+                                              useFramebufferCache, std::move(fd)) .get());
+    //...
+}
+
+
+std::future<RenderEngineResult> RenderEngine::drawLayers(
+        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+        base::unique_fd&& bufferFence) {
+    const auto resultPromise = std::make_shared<std::promise<RenderEngineResult>>();
+    std::future<RenderEngineResult> resultFuture = resultPromise->get_future();
+    //调用子类的drawLayersInternal
+    drawLayersInternal(std::move(resultPromise), display, layers, buffer, useFramebufferCache,
+                       std::move(bufferFence));
+    return resultFuture;
+}
+
+```
+
+注释85处通过渲染引擎的drawLayers完成GPU合成
+
+> frameworks/native/libs/renderengine/gl/GLESRenderEngine.cpp
+
+```cpp
+void GLESRenderEngine::drawLayersInternal(
+        const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
+        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+        base::unique_fd&& bufferFence) {
+    //要等前一帧的release fence
+    if (bufferFence.get() >= 0) {
+        base::unique_fd bufferFenceDup(dup(bufferFence.get()));
+        if (bufferFenceDup < 0 || !waitFence(std::move(bufferFenceDup))) {
+            sync_wait(bufferFence.get(), -1);
+        }
+    }
+    if (buffer == nullptr) {
+        return BAD_VALUE;
+    }
+    std::unique_ptr<BindNativeBufferAsFramebuffer> fbo;
+    std::deque<const LayerSettings*> blurLayers;
+    if (CC_LIKELY(mBlurFilter != nullptr)) {
+        for (auto layer : layers) {
+            if (layer->backgroundBlurRadius > 0) {
+                blurLayers.push_back(layer);
+            }
+        }
+    }
+    const auto blurLayersSize = blurLayers.size();
+
+    if (blurLayersSize == 0) {
+        //将dequeue出来的buffer绑定到Framebuffer上面，作为fbo
+        //这里会走BindNativeBufferAsFramebuffer的构造函数
+        fbo = std::make_unique<BindNativeBufferAsFramebuffer>(*this,buffer.get()->getNativeBuffer(), useFramebufferCache);
+        //设置视图和投影矩阵
+        setViewportAndProjection(display.physicalDisplay, display.clip);
+		//...
+    }
+	//...
+    //88 真正GPU合成流程后面继续看 
+}
+std::unique_ptr<Framebuffer> GLESRenderEngine::createFramebuffer() {
+    //GLFramebuffer创建时绑定了GLESRenderEngine
+    return std::make_unique<GLFramebuffer>(*this);
+}
+//RenderEngine.h
+class BindNativeBufferAsFramebuffer {
+    public:
+    BindNativeBufferAsFramebuffer(RenderEngine& engine, ANativeWindowBuffer* buffer,
+                                  const bool useFramebufferCache)
+        : mEngine(engine), mFramebuffer(mEngine.getFramebufferForDrawing()), mStatus(NO_ERROR) {
+            //86 mFramebuffer是在GLESRenderEngine的构造函数中createFramebuffer时创建的GLFramebuffer
+            //这里先执行setNativeWindowBuffer，如果返回true，执行 mEngine.bindFrameBuffer
+            mStatus = mFramebuffer->setNativeWindowBuffer(buffer, mEngine.isProtected(),useFramebufferCache)
+                ? mEngine.bindFrameBuffer(mFramebuffer)
+                : NO_MEMORY;
+        }
+}
+//GLFramebuffer.cpp
+bool GLFramebuffer::setNativeWindowBuffer(ANativeWindowBuffer* nativeBuffer, bool isProtected,
+                                          const bool useFramebufferCache) {
+    if (mEGLImage != EGL_NO_IMAGE_KHR) {
+        if (!usingFramebufferCache) {
+            eglDestroyImageKHR(mEGLDisplay, mEGLImage);
+            DEBUG_EGL_IMAGE_TRACKER_DESTROY();
+        }
+        mEGLImage = EGL_NO_IMAGE_KHR;
+        mBufferWidth = 0;
+        mBufferHeight = 0;
+    }
+
+    if (nativeBuffer) {
+        //87 调用绑定的GLESRenderEngine.createFramebufferImageIfNeeded
+        mEGLImage = mEngine.createFramebufferImageIfNeeded(nativeBuffer, isProtected,useFramebufferCache);
+        if (mEGLImage == EGL_NO_IMAGE_KHR) {
+            return false;
+        }
+        usingFramebufferCache = useFramebufferCache;
+        mBufferWidth = nativeBuffer->width;
+        mBufferHeight = nativeBuffer->height;
+    }
+    return true;
+}
+```
+
+注释86处先执行GLFramebuffer.setNativeWindowBuffer，如果返回true，执行 mEngine.bindFrameBuffer
+
+先看注释87处调了GLESRenderEngine.createFramebufferImageIfNeeded
+
+```c++
+EGLImageKHR GLESRenderEngine::createFramebufferImageIfNeeded(ANativeWindowBuffer* nativeBuffer,
+                                                             bool isProtected,
+                                                             bool useFramebufferCache) {
+    //将ANativeWindowBuffer转换成GraphicsBuffer
+    sp<GraphicBuffer> graphicBuffer = GraphicBuffer::from(nativeBuffer);
+    //使用cache，如果有一样的image，就直接返回
+    if (useFramebufferCache) {
+        std::lock_guard<std::mutex> lock(mFramebufferImageCacheMutex);
+        for (const auto& image : mFramebufferImageCache) {
+            if (image.first == graphicBuffer->getId()) {
+                return image.second;
+            }
+        }
+    }
+    EGLint attributes[] = {
+            isProtected ? EGL_PROTECTED_CONTENT_EXT : EGL_NONE,
+            isProtected ? EGL_TRUE : EGL_NONE,
+            EGL_NONE,
+    };
+    //将dequeue出来的buffer作为参数创建 EGLImage
+    EGLImageKHR image = eglCreateImageKHR(mEGLDisplay, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
+                                          nativeBuffer, attributes);
+    if (useFramebufferCache) {
+        if (image != EGL_NO_IMAGE_KHR) {
+            std::lock_guard<std::mutex> lock(mFramebufferImageCacheMutex);
+            if (mFramebufferImageCache.size() >= mFramebufferImageCacheSize) {
+                EGLImageKHR expired = mFramebufferImageCache.front().second;
+                mFramebufferImageCache.pop_front();
+                eglDestroyImageKHR(mEGLDisplay, expired);
+                DEBUG_EGL_IMAGE_TRACKER_DESTROY();
+            }
+            //把image放到mFramebufferImageCache里面
+            mFramebufferImageCache.push_back({graphicBuffer->getId(), image});
+        }
+    }
+    return image;
+}
+```
+
+再看GLESRenderEngine.bindFrameBuffer
+
+```c++
+status_t GLESRenderEngine::bindFrameBuffer(Framebuffer* framebuffer) {
+    GLFramebuffer* glFramebuffer = static_cast<GLFramebuffer*>(framebuffer);
+    //上一步创建的EGLImage
+    EGLImageKHR eglImage = glFramebuffer->getEGLImage();
+    //创建RenderEngine时就已经创建好的texture id和fb id
+    uint32_t textureName = glFramebuffer->getTextureName();
+    uint32_t framebufferName = glFramebuffer->getFramebufferName();
+    //绑定texture，后面的操作将作用在这上面
+    glBindTexture(GL_TEXTURE_2D, textureName);
+    //根据EGLImage 创建一个2D texture
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)eglImage);
+    //Bind the Framebuffer to render into
+    glBindFramebuffer(GL_FRAMEBUFFER, framebufferName);
+    //将纹理附着在帧缓存上面，渲染到farmeBuffer
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureName, 0);
+    uint32_t glStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    return glStatus == GL_FRAMEBUFFER_COMPLETE_OES ? NO_ERROR : BAD_VALUE;
+}
+```
+
+首先将dequeue出来的buffer通过eglCreateImageKHR做成image，然后通过glEGLImageTargetTexture2DOES根据image创建一个2D的纹理，再通过glFramebufferTexture2D把纹理附着在帧缓存上面。 再继续看注释88处GLESRenderEngine::drawLayersInternal后面的流程
+
+```c++
+void GLESRenderEngine::drawLayersInternal(...){
+    std::unique_ptr<BindNativeBufferAsFramebuffer> fbo;
+    //...
+    //88 此时已经准备好fbo 
+    //设置顶点和纹理坐标的size
+    Mesh mesh = Mesh::Builder()
+        .setPrimitive(Mesh::TRIANGLE_FAN)
+        .setVertices(4 /* count */, 2 /* size */)
+        .setTexCoords(2 /* size */)
+        .setCropCoords(2 /* size */)
+        .build();
+
+    for (const auto& layer : layers) {
+        //先校验
+        if (blurLayers.size() > 0 && blurLayers.front() == layer) {
+            blurLayers.pop_front();
+               auto status = mBlurFilter->prepare();
+            if (status != NO_ERROR) {
+                 return;
+            }
+            //...省略其他校验条件
+        }
+        
+        // Ensure luminance is at least 100 nits to avoid div-by-zero
+        //避免计算的时候被除数是0，设置最少为100
+        const float maxLuminance = std::max(100.f, layer.source.buffer.maxLuminanceNits);
+        mState.maxMasteringLuminance = maxLuminance;
+        mState.maxContentLuminance = maxLuminance;
+        mState.projectionMatrix = projectionMatrix * layer.geometry.positionTransform;
+        
+        //获取layer的大小
+        const FloatRect bounds = layer.geometry.boundaries;
+        Mesh::VertexArray<vec2> position(mesh.getPositionArray<vec2>());
+        //设置顶点的坐标，逆时针方向
+        position[0] = vec2(bounds.left, bounds.top);
+        position[1] = vec2(bounds.left, bounds.bottom);
+        position[2] = vec2(bounds.right, bounds.bottom);
+        position[3] = vec2(bounds.right, bounds.top);
+        //设置crop的坐标
+        setupLayerCropping(layer, mesh);
+        //设置颜色矩阵
+        setColorTransform(layer.colorTransform);
+        
+        bool usePremultipliedAlpha = true;
+        bool disableTexture = true;
+        bool isOpaque = false;
+        //Buffer相关设置
+        if (layer.source.buffer.buffer != nullptr) {
+            disableTexture = false;
+            isOpaque = layer.source.buffer.isOpaque;
+
+            //layer的buffer，即输入的buffer
+            sp<GraphicBuffer> gBuf = layer.source.buffer.buffer->getBuffer();
+            validateInputBufferUsage(gBuf);
+            //textureName是创建BufferQueuelayer时生成的，用来标识这个layer，
+            //fence是acquire fence
+            bindExternalTextureBuffer(layer.source.buffer.textureName, gBuf,
+                                      layer.source.buffer.fence);
+
+            usePremultipliedAlpha = layer.source.buffer.usePremultipliedAlpha;
+            Texture texture(Texture::TEXTURE_EXTERNAL, layer.source.buffer.textureName);
+            mat4 texMatrix = layer.source.buffer.textureTransform;
+
+            texture.setMatrix(texMatrix.asArray());
+            texture.setFiltering(layer.source.buffer.useTextureFiltering);
+
+            texture.setDimensions(gBuf->getWidth(), gBuf->getHeight());
+            setSourceY410BT2020(layer.source.buffer.isY410BT2020);
+
+            renderengine::Mesh::VertexArray<vec2> texCoords(mesh.getTexCoordArray<vec2>());
+            //设置纹理坐标，也是逆时针
+            texCoords[0] = vec2(0.0, 0.0);
+            texCoords[1] = vec2(0.0, 1.0);
+            texCoords[2] = vec2(1.0, 1.0);
+            texCoords[3] = vec2(1.0, 0.0);
+            //设置纹理的参数
+            setupLayerTexturing(texture);
+        }
+        //有阴影
+        if (layer.shadow.length > 0.0f) {
+            handleShadow(layer.geometry.boundaries, layer.geometry.roundedCornersRadius,layer.shadow);
+        } else if (layer.geometry.roundedCornersRadius > 0.0 && color.a >= 1.0f && isOpaque) {
+            //有圆角
+            handleRoundedCorners(display, layer, mesh);
+        } else {
+            //89 正常绘制
+            drawMesh(mesh);
+        }
+    }
+}
+void GLESRenderEngine::bindExternalTextureBuffer(uint32_t texName, const sp<GraphicBuffer>& buffer,const sp<Fence>& bufferFence) {
+	//先从缓存中找是否有相同的buffer
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(mRenderingMutex);
+        auto cachedImage = mImageCache.find(buffer->getId());
+        found = (cachedImage != mImageCache.end());
+    }
+    if (!found) {
+        //如果ImageCache里面没有则需要重新创建一个EGLImage，创建输入的EGLImage是在ImageManager线程里面，利用notify唤醒机制
+        status_t cacheResult = mImageManager->cache(buffer);
+        if (cacheResult != NO_ERROR) {
+            return;
+        }
+    }
+    //把EGLImage转换成纹理，类型为GL_TEXTURE_EXTERNAL_OES
+    bindExternalTextureImage(texName, *cachedImage->second);
+    //...
+}
+
+void GLESRenderEngine::bindExternalTextureImage(uint32_t texName, const Image& image) {
+    const GLImage& glImage = static_cast<const GLImage&>(image);
+    const GLenum target = GL_TEXTURE_EXTERNAL_OES;
+    //绑定纹理，纹理ID为texName
+    glBindTexture(target, texName);
+    if (glImage.getEGLImage() != EGL_NO_IMAGE_KHR) {
+        // 把EGLImage转换成纹理，纹理ID为texName
+        glEGLImageTargetTexture2DOES(target, static_cast<GLeglImageOES>(glImage.getEGLImage()));
+    }
+}
+```
+
+至此，将输入和输出的Buffer都生成了纹理，以及设置了纹理的坐标和顶点的坐标，接下来再看注释89 drawMesh绘制
+
+```c++
+void GLESRenderEngine::drawMesh(const Mesh& mesh) {
+    if (mesh.getTexCoordsSize()) {
+        //开启顶点着色器属性，目的是能在顶点着色器中访问顶点的属性数据
+        glEnableVertexAttribArray(Program::texCoords);
+        //给顶点着色器传纹理的坐标
+        glVertexAttribPointer(Program::texCoords, mesh.getTexCoordsSize(), GL_FLOAT, GL_FALSE,
+                              mesh.getByteStride(), mesh.getTexCoords());
+    }
+    //给顶点着色器传顶点的坐标
+    glVertexAttribPointer(Program::position, mesh.getVertexSize(), GL_FLOAT, GL_FALSE,mesh.getByteStride(), mesh.getPositions());
+    //...省略圆角和阴影的处理
+    
+    //创建顶点和片段着色器，将顶点属性设和一些常量参数设到shader里面
+    ProgramCache::getInstance().useProgram(mInProtectedContext ? mProtectedEGLContext : mEGLContext,managedState);
+    //调GPU去draw
+    glDrawArrays(mesh.getPrimitive(), 0, mesh.getVertexCount());
+}
+```
+
