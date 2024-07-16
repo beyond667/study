@@ -4236,6 +4236,14 @@ void GLESRenderEngine::drawLayersInternal(...){
             drawMesh(mesh);
         }
     }
+    
+    //90 再调用flush，获取到Fence
+    base::unique_fd drawFence = flush();
+    mLastDrawFence = new Fence(dup(drawFence.get()));
+    mPriorResourcesCleaned = false;
+
+    resultPromise->set_value({NO_ERROR, std::move(drawFence)});
+    return;
 }
 void GLESRenderEngine::bindExternalTextureBuffer(uint32_t texName, const sp<GraphicBuffer>& buffer,const sp<Fence>& bufferFence) {
 	//先从缓存中找是否有相同的buffer
@@ -4269,7 +4277,7 @@ void GLESRenderEngine::bindExternalTextureImage(uint32_t texName, const Image& i
 }
 ```
 
-至此，将输入和输出的Buffer都生成了纹理，以及设置了纹理的坐标和顶点的坐标，接下来再看注释89 drawMesh绘制
+先将输入和输出的Buffer都生成了纹理，以及设置了纹理的坐标和顶点的坐标，先看注释89 drawMesh绘制，再看注释90处flush
 
 ```c++
 void GLESRenderEngine::drawMesh(const Mesh& mesh) {
@@ -4286,8 +4294,182 @@ void GLESRenderEngine::drawMesh(const Mesh& mesh) {
     
     //创建顶点和片段着色器，将顶点属性设和一些常量参数设到shader里面
     ProgramCache::getInstance().useProgram(mInProtectedContext ? mProtectedEGLContext : mEGLContext,managedState);
-    //调GPU去draw
+    //91 调GPU去draw
+    //opengl提供的API接口，用来绘制图元。
+    //第一个参数代表绘制的opengl图元类型，比如三角形传GL_TRIANGLES，第二个参数代表顶点数组的起始索引，第三个参数代表打算绘制多少个顶点
     glDrawArrays(mesh.getPrimitive(), 0, mesh.getVertexCount());
+}
+//frameworks/native/libs/renderengine/gl/ProgramCache.cpp
+void ProgramCache::useProgram(EGLContext context, const Description& description) {
+    //generate the key for the shader based on the description
+    //设置key值，根据不同的key值创建不同的shader
+    Key needs(computeKey(description));
+
+    //look-up the program in the cache
+    auto& cache = mCaches[context];
+    //如果cache里面没有相同的program则重新创建一个
+    auto it = cache.find(needs);
+    if (it == cache.end()) {
+        // we didn't find our program, so generate one...
+        nsecs_t time = systemTime();
+        //生成可执行程序
+        it = cache.emplace(needs, generateProgram(needs)).first;
+        time = systemTime() - time;
+    }
+
+    // here we have a suitable program for this description
+    std::unique_ptr<Program>& program = it->second;
+    if (program->isValid()) {
+        //执行可执行程序
+        program->use();
+        program->setUniforms(description);
+    }
+}
+std::unique_ptr<Program> ProgramCache::generateProgram(const Key& needs) {
+    //创建顶点着色器，其实就是拼接了个可执行程序的字符串
+    String8 vs = generateVertexShader(needs);
+    //创建片段着色器，同上，拼接了个可执行程序的字符串
+    String8 fs = generateFragmentShader(needs);
+    //链接和编译着色器，把上面生成的两个字符串传到Program的构造函数中
+    return std::make_unique<Program>(needs, vs.string(), fs.string());
+}
+//这里拼接了个可执行程序
+String8 ProgramCache::generateFragmentShader(const Key& needs) {
+    Formatter fs;
+    if (needs.getTextureTarget() == Key::TEXTURE_EXT) {
+        fs << "#extension GL_OES_EGL_image_external : require";
+    }
+    fs << "precision mediump float;";
+    if (needs.getTextureTarget() == Key::TEXTURE_EXT) {
+        fs << "uniform samplerExternalOES sampler;";
+    } else if (needs.getTextureTarget() == Key::TEXTURE_2D) {
+        fs << "uniform sampler2D sampler;";
+    }
+    if (needs.hasTextureCoords()) {
+        fs << "varying vec2 outTexCoords;";
+    }
+    //...省略拼接其他内容
+    // 拼接void main(void){}，相当于生成个可执行程序
+    fs << "void main(void) {" << indent;
+    if (needs.drawShadows()) {
+        fs << "gl_FragColor = getShadowColor();";
+    } else {
+        if (needs.isTexturing()) {
+            fs << "gl_FragColor = texture2D(sampler, outTexCoords);";
+            if (needs.isY410BT2020()) {
+                fs << "gl_FragColor.rgb = convertY410BT2020(gl_FragColor.rgb);";
+            }
+        } else {
+            fs << "gl_FragColor.rgb = color.rgb;";
+            fs << "gl_FragColor.a = 1.0;";
+        }
+        if (needs.isOpaque()) {
+            fs << "gl_FragColor.a = 1.0;";
+        }
+    }
+    //...
+    if (needs.hasRoundedCorners()) {
+        if (needs.isPremultiplied()) {
+            fs << "gl_FragColor *= vec4(applyCornerRadius(outCropCoords));";
+        } else {
+            fs << "gl_FragColor.a *= applyCornerRadius(outCropCoords);";
+        }
+    }
+
+    fs << dedent << "}";
+    return fs.getString();
+}
+
+Program::Program(const ProgramCache::Key& /*needs*/, const char* vertex, const char* fragment): mInitialized(false) {
+    //编译顶点和片段着色器
+    GLuint vertexId = buildShader(vertex, GL_VERTEX_SHADER);
+    GLuint fragmentId = buildShader(fragment, GL_FRAGMENT_SHADER);
+    //创建programID
+    GLuint programId = glCreateProgram();
+    //将顶点和片段着色器链接到programe
+    glAttachShader(programId, vertexId);
+    glAttachShader(programId, fragmentId);
+    //将着色器里面的属性和自定义的属性变量绑定
+    glBindAttribLocation(programId, position, "position");
+    glBindAttribLocation(programId, texCoords, "texCoords");
+    glBindAttribLocation(programId, cropCoords, "cropCoords");
+    glBindAttribLocation(programId, shadowColor, "shadowColor");
+    glBindAttribLocation(programId, shadowParams, "shadowParams");
+    glLinkProgram(programId);
+
+    GLint status;
+    glGetProgramiv(programId, GL_LINK_STATUS, &status);
+    if (status != GL_TRUE) {
+        //...
+    }else{
+        mProgram = programId;
+        mVertexShader = vertexId;
+        mFragmentShader = fragmentId;
+        mInitialized = true;
+        //获得着色器里面uniform变量的位置
+        mProjectionMatrixLoc = glGetUniformLocation(programId, "projection");
+        mTextureMatrixLoc = glGetUniformLocation(programId, "texture");
+        mSamplerLoc = glGetUniformLocation(programId, "sampler");
+        mColorLoc = glGetUniformLocation(programId, "color");
+        //...
+        
+        // set-up the default values for our uniforms
+        glUseProgram(programId);
+        glUniformMatrix4fv(mProjectionMatrixLoc, 1, GL_FALSE, mat4().asArray());
+        glEnableVertexAttribArray(0);
+    }
+}
+
+void Program::use() {
+    //使Program生效，安装一个程序对象作为当前渲染状态的一部分
+	//此为opengl的一个api函数：安装一个程序对象作为当前渲染状态的一部分
+    glUseProgram(mProgram);
+}
+void Program::setUniforms(const Description& desc) {
+    // 根据uniform的位置，给uniform变量设置，设到shader里面
+    if (mSamplerLoc >= 0) {
+        glUniform1i(mSamplerLoc, 0);
+        glUniformMatrix4fv(mTextureMatrixLoc, 1, GL_FALSE, desc.texture.getMatrix().asArray());
+    }
+    if (mColorLoc >= 0) {
+        const float color[4] = {desc.color.r, desc.color.g, desc.color.b, desc.color.a};
+        glUniform4fv(mColorLoc, 1, color);
+    }
+    //...省略其他变量的设置
+    // these uniforms are always present
+    glUniformMatrix4fv(mProjectionMatrixLoc, 1, GL_FALSE, desc.projectionMatrix.asArray());
 }
 ```
 
+对于GPU来说，输入都是一幅幅纹理，然后在着色器里面控制最后pixel的位置坐标和颜色值，最后在注释91处调用opengl提供的glDrawArrays接口使用GPU来绘制图元。再继续看注释90处flush
+
+```c++
+base::unique_fd GLESRenderEngine::flush() {
+    if (!GLExtensions::getInstance().hasNativeFenceSync()) {
+        return base::unique_fd();
+    }
+    //创建一个EGLSync对象，用来标识GPU是否绘制完
+    EGLSyncKHR sync = eglCreateSyncKHR(mEGLDisplay, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+    if (sync == EGL_NO_SYNC_KHR) {
+        return base::unique_fd();
+    }
+    
+    //opengl的api接口。用于强制刷新缓冲，保证绘图命令将被执行
+    //92 将gl command命令全部刷给GPU
+    glFlush();
+
+    //获得android 使用的fence fd
+    base::unique_fd fenceFd(eglDupNativeFenceFDANDROID(mEGLDisplay, sync));
+    eglDestroySyncKHR(mEGLDisplay, sync);
+
+    if (CC_UNLIKELY(mTraceGpuCompletion && mFlushTracer) && fenceFd.get() >= 0) {
+        mFlushTracer->queueSync(eglCreateSyncKHR(mEGLDisplay, EGL_SYNC_FENCE_KHR, nullptr));
+    }
+
+    return fenceFd;
+}
+```
+
+在注释92处执行opengl的接口glFlush将命令全部刷给GPU，这些命令会被gpu执行，GPU自己去draw。  
+
+小结：composeSurfaces实现GPU合成可以理解成通过opengl把buffer数据转换成fence数据。先将dequeue出来的buffer通过eglCreateImageKHR做成image，然后通过glEGLImageTargetTexture2DOES根据image创建一个2D的纹理，再通过glFramebufferTexture2D把纹理附着在帧缓存上面。之后在drawMesh拼接并使用一个可执行的程序，然后执行opengl的glDrawArrays方法来让GPU绘制图元，最后在flush方法中调用opengl的glFlush方法来强制刷新缓存，保证绘图命令将被执行，之后就可以获取android层用到的fence来完成后面的把fence传给屏幕驱动完成显示。
