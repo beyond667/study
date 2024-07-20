@@ -571,7 +571,7 @@ void MessageQueue::waitMessage() {
 
 可以看到SurfaceFlinger的主线程通过死循环执行waitMessage，而其内部是通过mLooper->pollOnce去获取消息。这块的Looper，MessageQueue和java层的不是同一个对象，此处的Looper和MQ是专门为SurfaceFlinger设计的。  
 
-到这里再完整总结下，SurfaceFlinger启动过程是从SurfaceFlinger.rc配置执行了main_surfaceflinger.cpp的main方法，这里会先创建SurfaceFlinger对象并执行其init方法，这里会先创建渲染引擎，硬件合成，再把其关联到合成引擎中，然后创建FrameBufferSurface（消费者）和RenderSurface（生产者） ，初始化scheduler，此时会创建两个EventThread线程：app，appsf线程，接收到vsync信号后app线程通知客户端执行绘制流程，appsf线程在一段时间后执行合成流程。初始化完之后surfaceflinger会发布到ServiceManager中，然后执行run在主线程执行waitMessage等待消息，内部是通过Looper.poolOnce去获取消息。  
+小结：SurfaceFlinger启动过程是从SurfaceFlinger.rc配置执行了main_surfaceflinger.cpp的main方法，这里会先创建SurfaceFlinger对象并执行其init方法，其会先创建渲染引擎，硬件合成，再把其关联到合成引擎中，然后创建FrameBufferSurface（消费者）和RenderSurface（生产者） ，初始化scheduler，此时会创建两个EventThread线程：app，appsf线程，接收到vsync信号后app线程通知客户端执行绘制流程，appsf线程在一段时间后执行合成流程。初始化完之后surfaceflinger会发布到ServiceManager中，然后执行run在主线程执行waitMessage等待消息，内部是通过Looper.poolOnce去获取消息。  
 
 SurfaceFlinger准备好后，就等待其他进程的召唤了。
 
@@ -1198,7 +1198,7 @@ sp<IBinder> Layer::getHandle() {
 }
 ```
 
-这个写法，只有第一次调用才返回了new handler，再调用就返回空，即getHandle期望用户只在创建layer时调用一次。
+这个写法，只有第一次调用才返回了new Handle，再调用就返回空，即getHandle期望用户只在创建layer时调用一次。
 
 ```cpp
 //layer.h
@@ -1316,7 +1316,8 @@ handle这个binder对象保存在SurfaceControl中并把SurfaceControl的地址�
 ```java
 //ViewRootImpl.relayoutWindow
 private int relayoutWindow(WindowManager.LayoutParams params...){
-    // 注释16 默认情况下useBLAST都是返回true
+    //... 省略上节relayoutWindow获取SurfaceControl
+    //注释16 默认情况下useBLAST都是返回true
     if (!useBLAST()) {
         mSurface.copyFrom(mSurfaceControl);
     } else {
@@ -1746,7 +1747,7 @@ static jlong nativeLockCanvas(JNIEnv* env, jclass clazz,
     // 47 surface调用lock函数锁定一块buffer
     status_t err = surface->lock(&buffer, dirtyRectPtr);
     //...
-    //48 通过Java层的canvas对象初始化一个native层的canvas对象，即SKCanvas
+    //48 通过Java层的canvas对象初始化一个native层的canvas对象，即SKiaCanvas
     graphics::Canvas canvas(env, canvasObj);
     //49 设置buffer，然后canvas把buffer转换为SKBitmap
     canvas.setBuffer(&buffer, static_cast<int32_t>(surface->getBuffersDataSpace()));
@@ -1771,10 +1772,10 @@ typedef struct ANativeWindow_Buffer {
 nativeLockCanvas主要分了三步：
 
 + 注释47 申请并锁定一块内存
-+ 注释48 获取native层的canvas对象，即SKCanvas
-+ 注释49 把buffer设置进canvas，其中SKCanvas会把buffer转换为SKBitmap，SKBitmap可以被canvas绘制
++ 注释48 获取native层的canvas对象，即SKiaCanvas
++ 注释49 把buffer设置进canvas，其中SKiaCanvas会把buffer转换为SKBitmap，SKBitmap可以被canvas绘制
 
-其实就是先申请一块buffer，再通过java层的canvas获取个native层的SKCanvas，再把buffer设置进SKCanvas，SKCanvas里会把buffer转换成SKBitmap，SKBitmap就可以被canvas直接绘制。
+其实就是先申请一块buffer，再通过java层的canvas获取个native层的SKiaCanvas，再把buffer设置进SKiaCanvas，SKiaCanvas里会把buffer转换成SKBitmap，SKBitmap就可以被canvas直接绘制。
 
 先看注释47 surface->lock
 
@@ -1920,8 +1921,9 @@ bool ACanvas_setBuffer(ACanvas* canvas, const ANativeWindow_Buffer* buffer,
 
 //frameworks/base/libs/hwui/SkiaCanvas.cpp 
 void SkiaCanvas::setBitmap(const SkBitmap& bitmap) {
-    //根据传入的bitmap创建一个SkCanvas，并更新
+    //根据传入的bitmap创建一个SkCanvas
     mCanvasOwned.reset(new SkCanvas(bitmap));
+    //52-1 更新SkiaCanvas中实际的mCanvas为新创建的SkCanvas
     mCanvas = mCanvasOwned.get();
 
     // clean up the old save stack
@@ -1929,7 +1931,8 @@ void SkiaCanvas::setBitmap(const SkBitmap& bitmap) {
 }
 ```
 
-注释52把获取的buffer转换为一个SkBitmap,此时bitmap中有有效信息，然后把此bitmap设置进SkiaCanvas并替换原来的Bitmap（SKBitmap可以被canvas绘制），接下来canvas就在这个bitmap上进行绘制。
++ 注释52把获取的buffer转换为一个SkBitmap,此时bitmap中有有效信息，然后把此bitmap设置进SkiaCanvas并替换原来的Bitmap（SKBitmap可以被canvas绘制），接下来canvas就在这个bitmap上进行绘制。
++ 注释52-1处把SkiaCanvas内部的mCanvas更新为新创建的持有SKBitmap的SkCanvas。可以理解成SkiaCanvas其实是对SkCanvas做了一层封装，实际操作的是SkCanvas
 
 > 可以把Canvas理解成画布，把画布想象成一块内存空间，也就是一个Bitmap，Canvas的API提供了一整套在这个Bitmap上绘图的方法。
 
