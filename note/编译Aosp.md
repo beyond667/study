@@ -107,7 +107,23 @@ repo sync
 
 ---
 
-
+> repo sync后出现如下错误：
+>
+> ```csharp
+> info: A new version of repo is available
+> warning: repo is not tracking a remote branch, so it will not receive updates
+> repo reset: error: Entry 'command.py' not uptodate. Cannot merge.
+> fatal: 不能重置索引文件至版本 'v2.17.3^0'
+> ```
+>
+> 按如下命令：
+>
+> ```bash
+> cd ./repo/repo 
+> git pull
+> cd ../..
+> repo sync -j4
+> ```
 
 ##### 编译
 
