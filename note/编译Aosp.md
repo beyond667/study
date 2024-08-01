@@ -326,5 +326,23 @@ fastboot flashing unlock #解锁
 fastboot flashall -w #刷机
 ```
 
+##### 单编系统
+
+```ini
+#修改位于framework/base/core下的，产物位于out/target/product/qssi/system/framework下面，拿出来push到手机的system/framework/
+make framework-minus-apex -j16
+#修改位于framework/base/services下的，同上push到system/framework/
+make services -j16
+#修改位于frameworks/base/core/res下的，同上push到system/framework/
+make framework-res -j16
+
+#push命令如：
+adb push \\192.168.211.129\Downloads\aosp\out\target\product\oriole\system\framework\framework.jar /system/framework
+#再重启
+adb reboot
+```
+
+
+
 
 
