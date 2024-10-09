@@ -446,7 +446,7 @@ void IPCThreadState::blockUntilThreadAvailable()
     //加锁
     pthread_mutex_lock(&mProcess->mThreadCountLock);
     mProcess->mWaitingForThreads++;
-    //这个while循环表示正在等待执行的线程数大于最大的binder线程上限（16个）
+    //这个while循环表示正在等待执行的线程数大于最大的binder线程上限（15个）
     while (mProcess->mExecutingThreadsCount >= mProcess->mMaxThreads) {
         pthread_cond_wait(&mProcess->mThreadCountDecrement, &mProcess->mThreadCountLock);
     }
@@ -456,7 +456,7 @@ void IPCThreadState::blockUntilThreadAvailable()
 }
 ```
 
-while循环中代表如果正在等待执行的binder线程数大于16后就会调用`pthread_cond_wait`函数阻塞当前线程。blockUntilThreadAvailable先枷锁，如果执行此方法后卡顿或者binder线程的数量大于等于16，就需要等待系统释放其他的binder线程，直到小于16后才会释放锁，这也是jni层中binder的监听是否卡顿的原理。
+while循环中代表如果正在等待执行的binder线程数大于15后就会调用`pthread_cond_wait`函数阻塞当前线程。blockUntilThreadAvailable先枷锁，如果执行此方法后卡顿或者binder线程的数量大于等于15，就需要等待系统释放其他的binder线程，直到小于15后才会释放锁，这也是jni层中binder的监听是否卡顿的原理。
 
 #### 总结
 
