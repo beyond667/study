@@ -34,7 +34,7 @@ SystemServer进程是Android的核心进程，里面运行了很多核心服务�
         }
 ```
 
-这里以android12为例（10以后都是这样），网上有些资料版本较老，watchdog放到startOtherServices才启动，这个监控肯定越早越好。  
+这里以android12为例  
 
 Watchdog.java
 
@@ -504,7 +504,7 @@ Watchdog实现原理很简单：开机后先获取单例，在构造函数中把
 05-10 11:50:49.482  1000  1439  1627 W Watchdog: *** GOODBYE!
 ```
 
-可以看到是AppTransition.handleAppTransitionTimeout加锁后调用到performSurfacePlacement，直到调到SurfaceControl.nativeApplyTransaction(Native Method)后到jni层一直没有返回导致卡死。目前初步解决方案是把mService.mWindowPlacerLocked.performSurfacePlacement();放异步
+可以看到是AppTransition.handleAppTransitionTimeout加锁后调用到performSurfacePlacement，直到调到SurfaceControl.nativeApplyTransaction(Native Method)后到jni层一直没有返回导致卡死。目前初步解决方案是在开机过程中把mService.mWindowPlacerLocked.performSurfacePlacement();放异步
 
 ```java
 // AppTransition.java 
