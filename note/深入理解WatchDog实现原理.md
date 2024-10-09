@@ -76,7 +76,7 @@ public class Watchdog {
 
 初始化过程很简单，获取单例对象并调用start方法，启动异步线程执行run方法。  
 
-稍微跑题下：有些博客说watchdog本身是个Thread，这个说法是错误的，Watchdog并不是Thread，没有实现Runnable接口或者继承Thread，只是内部持有了mThread对象，构造方法里有个比较有意思的写法`mThread = new Thread(this::run, "watchdog");`，Thread的构造方法第一个参数是Runnable接口，但是传的是this::run，看着又像调用了内部的run方法，表面看应该编译错误的，实际上是java8的lamda写法，实际上等同于以下：
+稍微跑题下：构造方法里有个比较有意思的写法`mThread = new Thread(this::run, "watchdog");`，Thread的构造方法第一个参数是Runnable接口，但是传的是this::run，看着又像调用了内部的run方法，表面看应该编译错误的，实际上是java8的lamda写法，实际上等同于以下：
 
 ```java
 //1=====实际运行代码
